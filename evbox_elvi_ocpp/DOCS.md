@@ -1,5 +1,10 @@
 # EVBox Elvi OCPP bridge
 
+The canonical, step-by-step installation and migration procedure is maintained
+in [the Home Assistant guide](../docs/HOME_ASSISTANT.md). The reference below
+is kept with the add-on so it remains available from the app-store
+Documentation tab.
+
 ## Purpose
 
 This Home Assistant app is a deliberately frozen compatibility layer for one

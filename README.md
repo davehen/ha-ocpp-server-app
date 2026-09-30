@@ -7,8 +7,12 @@ MQTT Discovery.
 The app contains no charging, solar, scheduling, or load-balancing logic. Home
 Assistant remains responsible for all automation decisions.
 
-See [the app documentation](evbox_elvi_ocpp/DOCS.md) for installation,
-migration, and validation instructions.
+## Documentation
+
+- [Standalone server and manual tests](docs/STANDALONE.md)
+- [Automated build, mock, and tests](docs/VERIFY.md)
+- [Home Assistant installation and migration](docs/HOME_ASSISTANT.md)
+- [Home Assistant app-store documentation](evbox_elvi_ocpp/DOCS.md)
 
 ## Development checks
 
@@ -25,3 +29,7 @@ temporary MQTT broker, and OCPP/MQTT smoke test are run with:
 ```shell
 ./dev_scripts/verify.sh
 ```
+
+When behavior, entity IDs, configuration, images, or test coverage changes,
+update the applicable guide in `docs/` in the same change. Keep
+`evbox_elvi_ocpp/DOCS.md` aligned with the Home Assistant guide.
