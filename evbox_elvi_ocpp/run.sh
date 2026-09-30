@@ -1,4 +1,5 @@
 #!/usr/bin/with-contenv bashio
+# shellcheck shell=bash
 set -euo pipefail
 
 export MQTT_HOST
@@ -31,4 +32,3 @@ COMMAND_TIMEOUT="$(bashio::config command_timeout)"
 LOG_LEVEL="$(bashio::config log_level)"
 
 exec python3 -m app.main
-

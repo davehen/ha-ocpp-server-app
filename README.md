@@ -18,3 +18,10 @@ The protocol tests use only the Python standard library:
 PYTHONPATH=evbox_elvi_ocpp python3 -m unittest discover -s tests -v
 ruff check .
 ```
+
+With Docker and Colima running, the complete image build, in-container tests,
+temporary MQTT broker, and OCPP/MQTT smoke test are run with:
+
+```shell
+./dev_scripts/verify.sh
+```
