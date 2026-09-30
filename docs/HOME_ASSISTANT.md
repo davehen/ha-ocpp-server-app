@@ -1,68 +1,68 @@
-# Installazione e migrazione su Home Assistant
+# Home Assistant installation and migration
 
-Questa è la procedura canonica per sostituire l'integrazione custom OCPP con
-l'add-on EVBox Elvi OCPP bridge.
+This is the canonical procedure for replacing the custom OCPP integration with
+the EVBox Elvi OCPP bridge add-on.
 
-Il percorso dati finale è:
+The final data path is:
 
 ```text
 EVBox Elvi <-- OCPP 1.6J --> add-on <-- MQTT --> Home Assistant
 ```
 
-L'add-on non contiene logica solare, scheduling o load balancing. Le decisioni
-rimangono nelle automazioni Home Assistant.
+The add-on contains no solar, scheduling, charging-policy, or load-balancing
+logic. Home Assistant automations continue to make every charging decision.
 
-## Prerequisiti
+## Prerequisites
 
-- Home Assistant OS o una installazione che supporti gli add-on;
-- broker MQTT configurato attraverso il Supervisor;
-- integrazione MQTT attiva in Home Assistant con Discovery abilitato;
-- backup completo recente;
-- accesso alla configurazione OCPP della Elvi;
-- nessun veicolo in carica durante il cutover.
+- Home Assistant OS or another installation that supports add-ons;
+- an MQTT broker configured through the Supervisor;
+- the MQTT integration active in Home Assistant with Discovery enabled;
+- a recent full backup;
+- access to the Elvi OCPP configuration;
+- no vehicle charging during the cutover.
 
-Non possono esistere due server OCPP contemporaneamente sulla porta TCP 9000.
+Two OCPP servers cannot listen on TCP port 9000 at the same time.
 
-## Entità create
+## Entities created
 
-MQTT Discovery richiede esattamente questi entity ID:
+MQTT Discovery requests these exact entity IDs:
 
-| Entity ID | Uso |
+| Entity ID | Purpose |
 | --- | --- |
-| `switch.charger_charge_control` | Avvio e arresto remoto della sessione |
-| `switch.charger_availability` | Stato libero/occupato e disponibilità operativa |
-| `number.charger_maximum_current` | Limite di corrente accettato dalla Elvi |
-| `sensor.charger_power_active_import` | Potenza istantanea di ricarica in kW |
+| `switch.charger_charge_control` | Remotely start and stop a charging session |
+| `switch.charger_availability` | Free/occupied state and operative availability |
+| `number.charger_maximum_current` | Current limit accepted by the Elvi |
+| `sensor.charger_power_active_import` | Instantaneous charging power in kW |
 
-La dashboard `lovelace/vehicles_card.yaml`, l'automazione `Safely apply current
-on charger` e la logica di `Adapt charging power` usano questi nomi.
+The `lovelace/vehicles_card.yaml` dashboard, `Safely apply current on charger`,
+and the `Adapt charging power` logic use these names.
 
-La number contiene il limite comandato, non la corrente istantanea misurata. Il
-sensore power usa `Power.Active.Import` o, se assente, un fallback basato su
-corrente, tensione e numero di fasi.
+The number holds the commanded limit, not measured instantaneous current. The
+power sensor uses `Power.Active.Import`, or falls back to current, voltage, and
+the configured number of phases.
 
-## Aggiunta del repository
+## Add the repository
 
-Nella sezione add-on di Home Assistant:
+In the Home Assistant add-on section:
 
-1. apri lo store;
-2. apri il menu dei repository;
-3. aggiungi:
+1. open the store;
+2. open the repositories menu;
+3. add:
 
 ```text
 https://github.com/davehen/ha-ocpp-server-app
 ```
 
-4. aggiorna lo store;
-5. installa `EVBox Elvi OCPP bridge`;
-6. non avviarlo ancora.
+4. refresh the store;
+5. install `EVBox Elvi OCPP bridge`;
+6. do not start it yet.
 
-Lascia gli aggiornamenti automatici disabilitati. L'obiettivo del progetto è
-mantenere un server OCPP 1.6J stabile una volta validato.
+Leave automatic updates disabled. The project's purpose is to keep a stable
+OCPP 1.6J server once it has been validated.
 
-## Configurazione iniziale
+## Initial configuration
 
-I valori predefiniti sono:
+The default options are:
 
 ```yaml
 expected_charge_point_id: ""
@@ -76,41 +76,42 @@ command_timeout: 20
 log_level: INFO
 ```
 
-Mantieni la mappatura TCP `9000` su `9000`.
+Keep TCP port `9000` mapped to `9000`.
 
-- Lascia vuoto `expected_charge_point_id` al primo avvio. Copia poi dal log
-  l'ID rilevato e salvalo nell'opzione.
-- `id_tag` deve contenere da 1 a 20 caratteri ed è usato nel remote start.
-- `configure_meter_values` legge prima la configurazione della Elvi e modifica
-  soltanto valori diversi e scrivibili.
-- `maximum_current` è il tetto dei comandi MQTT e dello slider, non sostituisce
-  il limite elettrico dell'impianto.
-- `number_of_phases` viene usato soltanto per il calcolo di fallback della
-  potenza.
+- Leave `expected_charge_point_id` empty for the first start. Copy the detected
+  ID from the log and save it in this option afterwards.
+- `id_tag` must contain between 1 and 20 characters and is used for remote
+  starts.
+- `configure_meter_values` reads the Elvi configuration first and changes only
+  values that differ and are writable.
+- `maximum_current` is the ceiling for MQTT commands and the slider; it doesn't
+  replace the electrical installation limit.
+- `number_of_phases` is used only by the power fallback calculation.
 
-Il charge point ID filtra l'URL del client, ma non è autenticazione. La porta
-9000 deve rimanere sulla LAN fidata e non deve essere inoltrata da Internet.
+The charge point ID filters the client URL, but it is not authentication. Port
+9000 must remain on the trusted LAN and must never be forwarded from the
+Internet.
 
-## Limite delle automazioni device-based
+## Device-automation limitation
 
-Home Assistant salva nelle automazioni device-based gli ID interni del registro
-entità, non soltanto l'`entity_id` visibile. Le nuove entità MQTT possono
-riutilizzare i quattro nomi sopra, ma non possono ereditare gli ID interni
-dell'integrazione OCPP rimossa.
+Home Assistant stores internal entity-registry IDs in device-based automation
+blocks, not only the visible `entity_id`. The new MQTT entities can reuse the
+four names above, but they cannot inherit the internal IDs belonging to the
+removed OCPP integration.
 
-L'ispezione statica di `davehomeassistant` ha individuato quattro blocchi da
-sostituire:
+Static inspection of `davehomeassistant` found four blocks that must be
+replaced:
 
-- il trigger di `Adapt charging power`;
-- due condizioni di `Auto-start charging`;
-- l'azione di accensione di `Auto-start charging`.
+- the `Adapt charging power` trigger;
+- two `Auto-start charging` conditions;
+- the `Auto-start charging` turn-on action.
 
-`Safely apply current on charger` e `lovelace/vehicles_card.yaml` usano già gli
-entity ID visibili e non richiedono modifiche.
+`Safely apply current on charger` and `lovelace/vehicles_card.yaml` already use
+the visible entity IDs and don't require changes.
 
-### Trigger di Adapt charging power
+### Adapt charging power trigger
 
-Sostituisci il trigger device-based con:
+Replace the device-based trigger with:
 
 ```yaml
 - alias: When charging starts
@@ -120,9 +121,9 @@ Sostituisci il trigger device-based con:
   to: "on"
 ```
 
-### Condizioni di Auto-start charging
+### Auto-start charging conditions
 
-Sostituisci le due condizioni device-based con:
+Replace the two device-based conditions with:
 
 ```yaml
 - alias: Car is plugged in
@@ -135,9 +136,9 @@ Sostituisci le due condizioni device-based con:
   state: "off"
 ```
 
-### Azione di Auto-start charging
+### Auto-start charging action
 
-Sostituisci l'azione device-based con:
+Replace the device-based action with:
 
 ```yaml
 - action: switch.turn_on
@@ -145,105 +146,106 @@ Sostituisci l'azione device-based con:
     entity_id: switch.charger_charge_control
 ```
 
-Non applicare queste modifiche finché le nuove entità MQTT non esistono con gli
-ID esatti.
+Do not apply these changes until the new MQTT entities exist with the exact
+required IDs.
 
-## Risorse gestite dalla UI da controllare
+## UI-managed resources to inspect
 
-L'export del registro contiene anche:
+The entity-registry export also contains:
 
 - `script.charger_charge_control_guarded`;
 - `binary_sensor.car_is_charging`.
 
-Le relative definizioni non sono presenti nel repository. Prima del cutover,
-aprile nella UI e verifica che usino gli entity ID visibili. Sostituisci
-eventuali azioni device-based con azioni per entità.
+Their definitions are not present in the repository. Before the cutover, open
+them in the UI and confirm that they use visible entity IDs. Replace any
+device-based actions with entity actions.
 
-## Procedura sicura di cutover
+## Safe cutover procedure
 
-1. Assicurati che nessun veicolo stia caricando.
-2. Crea un backup completo di Home Assistant.
-3. Registra la versione e la configurazione dell'integrazione OCPP attuale.
-4. Disabilita temporaneamente `Safely apply current on charger`, `Adapt
-   charging power` e `Auto-start charging`.
-5. Installa e configura l'add-on senza avviarlo.
-6. Arresta e rimuovi la config entry della vecchia integrazione OCPP affinché i
-   quattro entity ID diventino liberi.
-7. Verifica che nessun altro processo occupi TCP 9000.
-8. Avvia l'add-on.
-9. Mantieni sulla Elvi l'URL:
+1. Make sure no vehicle is charging.
+2. Create a full Home Assistant backup.
+3. Record the version and configuration of the current OCPP integration.
+4. Temporarily disable `Safely apply current on charger`, `Adapt charging
+   power`, and `Auto-start charging`.
+5. Install and configure the add-on without starting it.
+6. Stop and remove the old OCPP integration config entry so the four entity IDs
+   become free.
+7. Confirm that no other process is using TCP port 9000.
+8. Start the add-on.
+9. Keep this URL on the Elvi:
 
    ```text
-   ws://<IP-HOME-ASSISTANT>:9000/<CHARGE-POINT-ID>
+   ws://<HOME-ASSISTANT-IP>:9000/<CHARGE-POINT-ID>
    ```
 
-10. Controlla nel log connessione, `BootNotification` e risposta `Accepted`.
-11. Copia l'ID dal log in `expected_charge_point_id`, salva e riavvia l'add-on.
-12. Verifica che le quattro entità siano state create senza suffissi numerici.
+10. Check the log for the connection, `BootNotification`, and an `Accepted`
+    response.
+11. Copy the ID from the log into `expected_charge_point_id`, save, and restart
+    the add-on.
+12. Confirm that the four entities were created without numeric suffixes.
 
-Un nome come `sensor.charger_power_active_import_2` indica che una vecchia
-entità possiede ancora l'ID richiesto. Non proseguire finché il conflitto non è
-stato risolto.
+A name such as `sensor.charger_power_active_import_2` means an old entity still
+owns the required ID. Do not continue until that conflict has been resolved.
 
-## Validazione funzionale
+## Functional validation
 
-Esegui la prova sotto supervisione diretta.
+Run this test under direct supervision.
 
-1. Senza veicolo, verifica availability `on`, charge control `off` e power
+1. Without a vehicle, verify availability `on`, charge control `off`, and power
    `0 kW`.
-2. Collega il veicolo e verifica availability `off` e charge control `off`.
-3. Avvia manualmente `switch.charger_charge_control`.
-4. Controlla nel log `RemoteStartTransaction`, `StartTransaction` e
-   `StatusNotification` di charging.
-5. Imposta 6 A, 8 A e 12 A. Per ogni valore controlla:
-   - `SetChargingProfile` accettato;
-   - aggiornamento di `number.charger_maximum_current`;
-   - corrente fisica coerente;
-   - aggiornamento di `sensor.charger_power_active_import`.
-6. Imposta 5 A e conferma la sospensione usata dall'automazione solare e power
-   a zero.
-7. Ripristina 12 A.
-8. Arresta la sessione e verifica `RemoteStopTransaction`, charge control
-   `off` e power a zero.
+2. Connect the vehicle and verify availability `off` and charge control `off`.
+3. Manually turn on `switch.charger_charge_control`.
+4. Check the log for `RemoteStartTransaction`, `StartTransaction`, and a
+   charging `StatusNotification`.
+5. Set 6 A, 8 A, and 12 A. For each value, confirm:
+   - an accepted `SetChargingProfile`;
+   - an updated `number.charger_maximum_current`;
+   - consistent physical current;
+   - an updated `sensor.charger_power_active_import`.
+6. Set 5 A and confirm the suspension behavior used by the solar automation and
+   power falling to zero.
+7. Restore 12 A.
+8. Stop the session and verify `RemoteStopTransaction`, charge control `off`,
+   and power at zero.
 
-Solo dopo questa prova applica i blocchi YAML sostitutivi.
+Apply the replacement YAML blocks only after this test passes.
 
-## Riattivazione delle automazioni
+## Re-enable automations
 
-Riattiva in questo ordine:
+Enable them in this order:
 
 1. `Safely apply current on charger`;
 2. `Adapt charging power`;
 3. `Auto-start charging`.
 
-Supervisiona almeno una sessione solare completa. Confronta ogni setpoint con
-il log dell'add-on, lo stato della number e la corrente fisica della Elvi.
+Supervise at least one complete solar-controlled session. Compare every
+setpoint with the add-on log, the number state, and the Elvi's physical current.
 
-## Comportamento in caso di errore
+## Failure behavior
 
-- Se la wallbox si disconnette, le entità MQTT diventano unavailable.
-- Un nuovo limite viene pubblicato soltanto dopo che la Elvi accetta
+- When the wallbox disconnects, MQTT entities become unavailable.
+- A new current limit is published only after the Elvi accepts
   `SetChargingProfile`.
-- Un rifiuto o timeout conserva il valore precedente, permettendo al watchdog
-  dell'automazione di riprovare.
-- Lo stop viene rifiutato se non è noto un transaction ID.
-- Un'azione OCPP non supportata riceve un `CALLERROR`.
-- JSON malformato viene ignorato senza arrestare il server.
-- Ultimo limite accettato e contatore delle transazioni sono salvati in `/data`
-  e inclusi nel backup dell'add-on.
+- A rejection or timeout preserves the previous value, allowing the automation
+  watchdog to retry.
+- A stop is rejected when no transaction ID is known.
+- An unsupported OCPP action receives a `CALLERROR`.
+- Malformed JSON is ignored without stopping the server.
+- The last accepted current and transaction counter are saved under `/data` and
+  included in add-on backups.
 
 ## Rollback
 
-1. Disabilita le tre automazioni di ricarica.
-2. Arresta l'add-on.
-3. Ripristina la vecchia integrazione e la sua configurazione, oppure il backup
-   completo.
-4. Verifica il ritorno delle quattro entità OCPP originali.
-5. Ripristina i blocchi device-based originali, se necessario.
-6. Prova manualmente start, cambio corrente e stop.
-7. Riattiva le automazioni soltanto dopo il test manuale.
+1. Disable the three charging automations.
+2. Stop the add-on.
+3. Restore the old integration and its configuration, or restore the complete
+   backup.
+4. Confirm that the four original OCPP entities return.
+5. Restore the original device-based blocks if necessary.
+6. Manually test start, current adjustment, and stop.
+7. Re-enable automations only after the manual test succeeds.
 
-## Guide correlate
+## Related guides
 
-- [Avvio e test standalone](STANDALONE.md)
-- [Build, mock e test automatici](VERIFY.md)
+- [Standalone server and manual testing](STANDALONE.md)
+- [Automated build, mock, and tests](VERIFY.md)

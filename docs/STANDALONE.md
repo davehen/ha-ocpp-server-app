@@ -1,26 +1,26 @@
-# Avvio e test standalone
+# Standalone server and manual testing
 
-Questa guida avvia il bridge fuori da Home Assistant usando Docker CLI e
-Colima. Docker Desktop non è richiesto né utilizzato.
+This guide runs the bridge outside Home Assistant using the Docker CLI and
+Colima. Docker Desktop is neither required nor used.
 
-L'ambiente risultante è:
+The resulting environment is:
 
 ```text
 EVBox Elvi <-- OCPP 1.6J --> bridge <-- MQTT --> Mosquitto
 ```
 
-Il bridge non contiene logica solare o di ricarica. Traduce soltanto messaggi
-OCPP e comandi MQTT.
+The bridge contains no solar, charging-policy, scheduling, or load-balancing
+logic. It only translates OCPP messages and MQTT commands.
 
-## Prerequisiti
+## Prerequisites
 
-Installa gli strumenti una sola volta:
+Install the tools once:
 
 ```shell
 brew install colima docker docker-buildx ruff shellcheck
 ```
 
-Avvia Colima:
+Start Colima:
 
 ```shell
 colima start --cpu 4 --memory 6 --disk 30
@@ -28,11 +28,11 @@ colima status
 docker version
 ```
 
-`colima status` deve riportare `colima is running` e runtime `docker`.
+`colima status` must report `colima is running` with the `docker` runtime.
 
-## Costruzione dell'immagine
+## Build the image
 
-Dalla root del repository, su Apple Silicon:
+From the repository root on Apple Silicon:
 
 ```shell
 cd /Users/davide.gallina/Development/personal/ha-ocpp-server-app
@@ -46,15 +46,15 @@ docker build \
   evbox_elvi_ocpp
 ```
 
-Su un Mac Intel sostituisci `aarch64` con `amd64` sia in `BUILD_FROM` sia in
+On an Intel Mac, replace `aarch64` with `amd64` in both `BUILD_FROM` and
 `BUILD_ARCH`.
 
-In alternativa, `./dev_scripts/verify.sh` costruisce la stessa immagine ed
-esegue anche tutti i controlli descritti in [VERIFY.md](VERIFY.md).
+Alternatively, `./dev_scripts/verify.sh` builds the same image and runs all the
+checks documented in [VERIFY.md](VERIFY.md).
 
-## Avvio del broker MQTT
+## Start the MQTT broker
 
-Crea una rete dedicata e avvia Mosquitto:
+Create a dedicated network and start Mosquitto:
 
 ```shell
 docker network create evbox-elvi-test
@@ -66,16 +66,17 @@ docker run --detach \
   eclipse-mosquitto:2
 ```
 
-Il broker non viene pubblicato sulla LAN: i comandi di questa guida usano gli
-strumenti `mosquitto_pub` e `mosquitto_sub` già presenti nel container.
+The broker isn't exposed to the LAN. The commands in this guide use the
+`mosquitto_pub` and `mosquitto_sub` utilities already included in the
+container.
 
-## Avvio del bridge
+## Start the bridge
 
-Lo script `/run.sh` dell'add-on usa `bashio` e richiede il Supervisor. In
-standalone bisogna quindi avviare direttamente `python3 -m app.main`.
+The add-on `/run.sh` script uses `bashio` and requires the Supervisor. In
+standalone mode, start `python3 -m app.main` directly.
 
-Per la prima prova mantieni vuoto `EXPECTED_CHARGE_POINT_ID` e disabilita la
-modifica automatica dei MeterValues:
+For the first test, leave `EXPECTED_CHARGE_POINT_ID` empty and disable automatic
+MeterValues configuration:
 
 ```shell
 docker volume create evbox-test-data
@@ -104,57 +105,58 @@ docker run --detach \
   -m app.main
 ```
 
-Segui i log in un altro terminale:
+Follow the logs in another terminal:
 
 ```shell
 docker logs --follow evbox-test-bridge
 ```
 
-## Collegamento della wallbox
+## Connect the wallbox
 
-Configura temporaneamente il server OCPP della Elvi come:
+Temporarily configure the Elvi OCPP server URL as:
 
 ```text
-ws://<IP-DEL-MAC>:9000/<CHARGE-POINT-ID>
+ws://<MAC-IP>:9000/<CHARGE-POINT-ID>
 ```
 
-Per esempio:
+For example:
 
 ```text
 ws://192.168.1.20:9000/EVB-P123
 ```
 
-L'ID è il segmento finale dell'URL. Per trovare l'indirizzo Wi-Fi del Mac:
+The charge point ID is the final URL segment. To find the Mac Wi-Fi address:
 
 ```shell
 ipconfig getifaddr en0
 ```
 
-Il log del bridge deve mostrare la connessione, il `BootNotification` e la
-risposta `Accepted`. Dopo avere confermato l'ID, ricrea il container impostando
-`EXPECTED_CHARGE_POINT_ID` allo stesso valore. Questo filtra client con un ID
-diverso, ma non è autenticazione: non pubblicare mai la porta 9000 su Internet.
+The bridge log must show the connection, `BootNotification`, and an `Accepted`
+response. After confirming the ID, recreate the container with
+`EXPECTED_CHARGE_POINT_ID` set to that value. This rejects clients using a
+different ID, but it is not authentication: never expose port 9000 to the
+Internet.
 
-## Stati da osservare
+## Observe state
 
-Per osservare tutti i topic runtime:
+Subscribe to all runtime topics:
 
 ```shell
 docker exec -it evbox-test-mqtt \
   mosquitto_sub -h localhost -v -t 'evbox_elvi/#'
 ```
 
-Gli stati principali sono:
+The primary state topics are:
 
-| Topic | Significato |
+| Topic | Meaning |
 | --- | --- |
-| `evbox_elvi/availability` | `online` dopo un `BootNotification` accettato |
-| `evbox_elvi/charge_control/state` | Stato della sessione di ricarica |
-| `evbox_elvi/charger_availability/state` | `ON` se il connettore è libero, `OFF` se è occupato o non disponibile |
-| `evbox_elvi/maximum_current/state` | Ultimo limite di corrente accettato dalla Elvi |
-| `evbox_elvi/power_active_import/state` | Potenza di ricarica misurata, in kW |
+| `evbox_elvi/availability` | `online` after an accepted `BootNotification` |
+| `evbox_elvi/charge_control/state` | Charging-session state |
+| `evbox_elvi/charger_availability/state` | `ON` when the connector is free; `OFF` when occupied or unavailable |
+| `evbox_elvi/maximum_current/state` | Last current limit accepted by the Elvi |
+| `evbox_elvi/power_active_import/state` | Measured charging power in kW |
 
-Per osservare esplicitamente limite e potenza:
+Subscribe specifically to the accepted current limit and measured power:
 
 ```shell
 docker exec -it evbox-test-mqtt mosquitto_sub -h localhost -v \
@@ -162,40 +164,40 @@ docker exec -it evbox-test-mqtt mosquitto_sub -h localhost -v \
   -t evbox_elvi/power_active_import/state
 ```
 
-Il numero rappresenta il limite comandato e accettato; non è la corrente
-istantanea misurata. La potenza è letta da `Power.Active.Import`, oppure
-calcolata da corrente e tensione quando tale measurand manca.
+The number is the commanded and accepted limit, not the instantaneous measured
+current. Power comes from `Power.Active.Import`, or is derived from current and
+voltage when that measurand is absent.
 
-La versione 1.0.0 non pubblica ancora sensori separati per corrente misurata in
-ampere, energia cumulativa o energia di sessione. Non confondere quindi
-`maximum_current/state` con l'amperaggio istantaneo.
+Version 1.0.0 doesn't yet publish separate sensors for measured current in
+amperes, cumulative energy, or session energy. Do not treat
+`maximum_current/state` as an instantaneous-current measurement.
 
-Per osservare i messaggi MQTT Discovery:
+Subscribe to MQTT Discovery messages with:
 
 ```shell
 docker exec -it evbox-test-mqtt \
   mosquitto_sub -h localhost -v -t 'homeassistant/#'
 ```
 
-## Comandi disponibili
+## Available commands
 
-Questi sono tutti i comandi MQTT pubblici implementati:
+These are all the public MQTT commands implemented by the bridge:
 
-| Topic | Payload | Effetto OCPP |
+| Topic | Payload | OCPP effect |
 | --- | --- | --- |
 | `evbox_elvi/charge_control/set` | `ON` | `RemoteStartTransaction` |
 | `evbox_elvi/charge_control/set` | `OFF` | `RemoteStopTransaction` |
 | `evbox_elvi/charger_availability/set` | `ON` | `ChangeAvailability: Operative` |
 | `evbox_elvi/charger_availability/set` | `OFF` | `ChangeAvailability: Inoperative` |
-| `evbox_elvi/maximum_current/set` | numero | `SetChargingProfile: TxDefaultProfile` |
+| `evbox_elvi/maximum_current/set` | number | `SetChargingProfile: TxDefaultProfile` |
 
-Il limite deve essere finito e compreso tra 0 e `MAXIMUM_CURRENT`. La Elvi può
-rifiutare valori che il suo firmware non supporta. Il valore 5 A è consentito
-per preservare il comportamento di sospensione usato dall'automazione solare.
+The current limit must be finite and between 0 and `MAXIMUM_CURRENT`. The Elvi
+may reject values unsupported by its firmware. A value of 5 A is allowed to
+preserve the suspension behavior used by the solar automation.
 
-### Regolazione della corrente
+### Adjust the current limit
 
-Apri prima il subscriber degli stati, poi prova in ordine 6, 8 e 12 A:
+Start the state subscriber first, then test 6, 8, and 12 A in that order:
 
 ```shell
 docker exec evbox-test-mqtt mosquitto_pub -h localhost \
@@ -208,49 +210,49 @@ docker exec evbox-test-mqtt mosquitto_pub -h localhost \
   -t evbox_elvi/maximum_current/set -m 12
 ```
 
-Verifica per ogni comando:
+For every command, verify:
 
-1. `SetChargingProfile` accettato nel log;
-2. aggiornamento di `maximum_current/state`;
-3. corrente e potenza fisiche coerenti.
+1. an accepted `SetChargingProfile` in the log;
+2. an updated `maximum_current/state`;
+3. consistent physical current and power.
 
-Prova 5 A solo dopo i valori normali:
+Test 5 A only after the normal values:
 
 ```shell
 docker exec evbox-test-mqtt mosquitto_pub -h localhost \
   -t evbox_elvi/maximum_current/set -m 5
 ```
 
-La prova deve mostrare il comportamento di sospensione già usato in Home
-Assistant e una potenza che scende a zero.
+The test must show the suspension behavior already used by Home Assistant and
+power falling to zero.
 
-Se la potenza non viene ricevuta perché la Elvi non ha già configurato i
-MeterValues richiesti, ricrea il bridge con
-`CONFIGURE_METER_VALUES=true`. Il bridge legge prima la configurazione e cambia
-soltanto le chiavi diverse e non read-only.
+If no power is received because the Elvi doesn't already have the required
+MeterValues configured, recreate the bridge with
+`CONFIGURE_METER_VALUES=true`. The bridge reads the existing configuration
+first and changes only values that differ and aren't read-only.
 
-### Avvio e arresto
+### Start and stop charging
 
-Con il veicolo collegato:
+With the vehicle connected:
 
 ```shell
 docker exec evbox-test-mqtt mosquitto_pub -h localhost \
   -t evbox_elvi/charge_control/set -m ON
 ```
 
-Attendi `StartTransaction`, quindi arresta:
+Wait for `StartTransaction`, then stop:
 
 ```shell
 docker exec evbox-test-mqtt mosquitto_pub -h localhost \
   -t evbox_elvi/charge_control/set -m OFF
 ```
 
-Lo stop viene rifiutato se il bridge non ha ancora ricevuto un transaction ID
-dalla wallbox.
+The stop command is rejected if the bridge has not received a transaction ID
+from the wallbox yet.
 
-### Disponibilità
+### Change availability
 
-Usa questi comandi solo dopo aver validato start, stop e corrente:
+Use these commands only after validating start, stop, and current control:
 
 ```shell
 docker exec evbox-test-mqtt mosquitto_pub -h localhost \
@@ -260,21 +262,21 @@ docker exec evbox-test-mqtt mosquitto_pub -h localhost \
   -t evbox_elvi/charger_availability/set -m ON
 ```
 
-`OFF` rende il connettore `Inoperative`; `ON` lo riporta `Operative`.
+`OFF` makes the connector `Inoperative`; `ON` returns it to `Operative`.
 
-## Sequenza di prova raccomandata
+## Recommended test sequence
 
-1. Avvia broker e bridge senza veicolo.
-2. Collega la Elvi e verifica `BootNotification`.
-3. Controlla availability `ON`, charge control `OFF` e potenza `0.000`.
-4. Collega il veicolo e verifica availability `OFF`.
-5. Avvia la sessione.
-6. Prova 6, 8 e 12 A verificando log, stati MQTT e comportamento fisico.
-7. Prova 5 A e conferma la sospensione.
-8. Ripristina 12 A, quindi arresta la sessione.
-9. Verifica charge control `OFF` e potenza `0.000`.
+1. Start the broker and bridge without a vehicle connected.
+2. Connect the Elvi and verify `BootNotification`.
+3. Check availability `ON`, charge control `OFF`, and power `0.000`.
+4. Connect the vehicle and verify availability `OFF`.
+5. Start the charging session.
+6. Test 6, 8, and 12 A while checking logs, MQTT state, and physical behavior.
+7. Test 5 A and confirm suspension.
+8. Restore 12 A, then stop the session.
+9. Verify charge control `OFF` and power `0.000`.
 
-## Arresto e pulizia
+## Stop and clean up
 
 ```shell
 docker stop evbox-test-bridge evbox-test-mqtt
@@ -282,12 +284,11 @@ docker rm evbox-test-bridge evbox-test-mqtt
 docker network rm evbox-elvi-test
 ```
 
-Il volume `evbox-test-data` viene conservato intenzionalmente. Per eliminare
-anche corrente persistita e contatore delle transazioni:
+The `evbox-test-data` volume is intentionally retained. To also remove the
+persisted current and transaction counter:
 
 ```shell
 docker volume rm evbox-test-data
 ```
 
-Quest'ultimo comando cancella lo stato del laboratorio e non è necessario per
-le esecuzioni successive.
+The last command erases the lab state and isn't required between runs.
