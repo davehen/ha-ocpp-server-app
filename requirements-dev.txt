@@ -1,0 +1,2 @@
+-r evbox_elvi_ocpp/requirements.txt
+ruff==0.11.0

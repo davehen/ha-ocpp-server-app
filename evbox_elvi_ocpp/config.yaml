@@ -1,0 +1,39 @@
+name: EVBox Elvi OCPP bridge
+version: "1.0.0"
+slug: evbox_elvi_ocpp
+description: Frozen OCPP 1.6J to MQTT bridge for an EVBox Elvi
+url: https://github.com/davehen/ha-ocpp-server-app
+arch:
+  - aarch64
+  - amd64
+startup: services
+boot: auto
+init: false
+watchdog: tcp://[HOST]:[PORT:9000]
+services:
+  - mqtt:need
+ports:
+  9000/tcp: 9000
+ports_description:
+  9000/tcp: OCPP 1.6J WebSocket server
+options:
+  expected_charge_point_id: ""
+  id_tag: HomeAssistant
+  heartbeat_interval: 300
+  meter_value_interval: 60
+  configure_meter_values: true
+  maximum_current: 16
+  number_of_phases: 3
+  command_timeout: 20
+  log_level: INFO
+schema:
+  expected_charge_point_id: str
+  id_tag: str
+  heartbeat_interval: int(30,3600)
+  meter_value_interval: int(10,3600)
+  configure_meter_values: bool
+  maximum_current: float(6,32)
+  number_of_phases: int(1,3)
+  command_timeout: int(5,60)
+  log_level: list(DEBUG|INFO|WARNING|ERROR)
+
