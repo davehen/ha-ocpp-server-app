@@ -41,7 +41,7 @@ docker build \
   --pull \
   --build-arg BUILD_FROM=ghcr.io/home-assistant/aarch64-base-python:3.13-alpine3.21-2025.11.1 \
   --build-arg BUILD_ARCH=aarch64 \
-  --build-arg BUILD_VERSION=1.0.0 \
+  --build-arg BUILD_VERSION=1.1.0 \
   --tag evbox-elvi-ocpp:test \
   evbox_elvi_ocpp
 ```
@@ -154,23 +154,29 @@ The primary state topics are:
 | `evbox_elvi/charge_control/state` | Charging-session state |
 | `evbox_elvi/charger_availability/state` | `ON` when the connector is free; `OFF` when occupied or unavailable |
 | `evbox_elvi/maximum_current/state` | Last current limit accepted by the Elvi |
+| `evbox_elvi/current_import/state` | Measured charging current in A |
 | `evbox_elvi/power_active_import/state` | Measured charging power in kW |
 
-Subscribe specifically to the accepted current limit and measured power:
+Subscribe specifically to the accepted current limit, measured current, and
+measured power:
 
 ```shell
 docker exec -it evbox-test-mqtt mosquitto_sub -h localhost -v \
   -t evbox_elvi/maximum_current/state \
+  -t evbox_elvi/current_import/state \
   -t evbox_elvi/power_active_import/state
 ```
 
-The number is the commanded and accepted limit, not the instantaneous measured
-current. Power comes from `Power.Active.Import`, or is derived from current and
-voltage when that measurand is absent.
+The maximum-current number is the commanded and accepted limit, not the
+instantaneous measurement. `current_import/state` comes from the latest
+`Current.Import` sample. If the Elvi reports one value per phase, the bridge
+publishes the average of the active phases. Power comes from
+`Power.Active.Import`, or is derived from current and voltage when that
+measurand is absent.
 
-Version 1.0.0 doesn't yet publish separate sensors for measured current in
-amperes, cumulative energy, or session energy. Do not treat
-`maximum_current/state` as an instantaneous-current measurement.
+Version 1.1.0 doesn't yet publish separate sensors for cumulative energy or
+session energy. Do not treat `maximum_current/state` as an
+instantaneous-current measurement.
 
 Subscribe to MQTT Discovery messages with:
 
@@ -214,7 +220,8 @@ For every command, verify:
 
 1. an accepted `SetChargingProfile` in the log;
 2. an updated `maximum_current/state`;
-3. consistent physical current and power.
+3. a consistent `current_import/state` measurement and physical current;
+4. consistent measured power.
 
 Test 5 A only after the normal values:
 
@@ -224,7 +231,7 @@ docker exec evbox-test-mqtt mosquitto_pub -h localhost \
 ```
 
 The test must show the suspension behavior already used by Home Assistant and
-power falling to zero.
+measured current and power falling to zero.
 
 If no power is received because the Elvi doesn't already have the required
 MeterValues configured, recreate the bridge with

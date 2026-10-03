@@ -20,12 +20,14 @@ class MqttBridge:
     AVAILABILITY = "availability"
     CHARGE_CONTROL = "charge_control"
     MAXIMUM_CURRENT = "maximum_current"
+    CURRENT_IMPORT = "current_import"
     POWER_ACTIVE_IMPORT = "power_active_import"
     CHARGER_AVAILABILITY = "charger_availability"
     DEFAULT_ENTITY_IDS = {
         CHARGE_CONTROL: "switch.charger_charge_control",
         CHARGER_AVAILABILITY: "switch.charger_availability",
         MAXIMUM_CURRENT: "number.charger_maximum_current",
+        CURRENT_IMPORT: "sensor.charger_current_import",
         POWER_ACTIVE_IMPORT: "sensor.charger_power_active_import",
     }
 
@@ -81,7 +83,7 @@ class MqttBridge:
         self._client.loop_stop()
 
     def publish_discovery(self) -> None:
-        """Publish retained MQTT Discovery definitions for the four required entities."""
+        """Publish retained MQTT Discovery definitions for the charger entities."""
         device = {
             "identifiers": ["evbox_elvi_ocpp_bridge"],
             "name": "charger",
@@ -100,7 +102,7 @@ class MqttBridge:
             "device": device,
             "origin": {
                 "name": "EVBox Elvi OCPP bridge",
-                "sw_version": "1.0.0",
+                "sw_version": "1.1.0",
                 "support_url": "https://github.com/davehen/ha-ocpp-server-app",
             },
             "qos": 1,
@@ -149,6 +151,21 @@ class MqttBridge:
                     "max": self._config.maximum_current,
                     "step": 0.1,
                     "mode": "slider",
+                },
+            ),
+            (
+                "sensor",
+                self.CURRENT_IMPORT,
+                {
+                    "name": "Current Import",
+                    "unique_id": "evbox_elvi_current_import",
+                    "default_entity_id": self.DEFAULT_ENTITY_IDS[self.CURRENT_IMPORT],
+                    "icon": "mdi:current-ac",
+                    "state_topic": self.topic(f"{self.CURRENT_IMPORT}/state"),
+                    "unit_of_measurement": "A",
+                    "device_class": "current",
+                    "state_class": "measurement",
+                    "suggested_display_precision": 3,
                 },
             ),
             (
@@ -210,6 +227,10 @@ class MqttBridge:
     def publish_power(self, kilowatts: float) -> None:
         """Publish active imported power in kilowatts."""
         self.publish(f"{self.POWER_ACTIVE_IMPORT}/state", f"{max(0.0, kilowatts):.3f}")
+
+    def publish_current(self, amperes: float) -> None:
+        """Publish measured imported current in amperes."""
+        self.publish(f"{self.CURRENT_IMPORT}/state", f"{max(0.0, amperes):.3f}")
 
     def publish_charger_online(self, online: bool) -> None:
         """Publish entity availability based on the OCPP connection."""

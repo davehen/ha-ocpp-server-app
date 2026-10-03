@@ -61,6 +61,7 @@ class BridgeController:
         self._mqtt.publish_charge_control(False)
         self._mqtt.publish_charger_availability(False)
         self._mqtt.publish_power(0)
+        self._mqtt.publish_current(0)
         self._mqtt.publish_maximum_current(self._store.state.maximum_current)
 
     async def attach(self, connection: OcppConnection) -> None:
@@ -148,6 +149,7 @@ class BridgeController:
         self._mqtt.publish_charge_control(False)
         self._mqtt.publish_charger_availability(False)
         self._mqtt.publish_power(0)
+        self._mqtt.publish_current(0)
         self._mqtt.publish_charger_online(True)
         return {
             "currentTime": utc_timestamp(),
@@ -181,6 +183,7 @@ class BridgeController:
         self._mqtt.publish_charger_availability(status == "Available")
         if status in ZERO_POWER_STATUSES:
             self._mqtt.publish_power(0)
+            self._mqtt.publish_current(0)
         return {}
 
     def _on_start_transaction(self, payload: dict[str, Any]) -> dict[str, Any]:
@@ -198,6 +201,7 @@ class BridgeController:
         self._charge_control = False
         self._mqtt.publish_charge_control(False)
         self._mqtt.publish_power(0)
+        self._mqtt.publish_current(0)
         return {"idTagInfo": {"status": ACCEPTED}}
 
     def _on_meter_values(self, payload: dict[str, Any]) -> dict[str, Any]:
@@ -207,6 +211,9 @@ class BridgeController:
         power_kw = extract_power_kw(payload, self._config.number_of_phases)
         if power_kw is not None:
             self._mqtt.publish_power(power_kw)
+        current_a = extract_current_a(payload)
+        if current_a is not None:
+            self._mqtt.publish_current(current_a)
         return {}
 
     @staticmethod
@@ -336,18 +343,7 @@ class BridgeController:
 
 def extract_power_kw(payload: dict[str, Any], number_of_phases: int) -> float | None:
     """Extract Power.Active.Import or derive it from standardized current/voltage samples."""
-    meter_values = [
-        meter_value
-        for meter_value in payload.get("meterValue", [])
-        if isinstance(meter_value, dict)
-    ]
-    if not meter_values:
-        return None
-    samples = [
-        sample
-        for sample in meter_values[-1].get("sampledValue", [])
-        if isinstance(sample, dict)
-    ]
+    samples = _latest_samples(payload)
 
     power_values = [
         _to_watts(sample)
@@ -387,15 +383,62 @@ def extract_power_kw(payload: dict[str, Any], number_of_phases: int) -> float | 
     return current * voltage * number_of_phases / 1000.0
 
 
+def extract_current_a(payload: dict[str, Any]) -> float | None:
+    """Extract the latest measured Current.Import value in amperes.
+
+    An explicit value without a phase is authoritative. If the charge point
+    reports individual phases, use the average of the active phases, matching
+    the amperes-per-phase meaning of an AC charging limit. All-zero phase
+    samples produce zero rather than no reading.
+    """
+    samples = _latest_samples(payload)
+    currents = _values_by_phase(
+        [sample for sample in samples if sample.get("unit", "A") == "A"],
+        "Current.Import",
+    )
+    aggregate = currents.get("")
+    if aggregate is not None:
+        return max(0.0, aggregate)
+
+    phase_values = [
+        value
+        for phase, value in currents.items()
+        if phase in {"L1", "L2", "L3"}
+    ]
+    if not phase_values:
+        return None
+    active_phase_values = [value for value in phase_values if value > 0]
+    if not active_phase_values:
+        return 0.0
+    return sum(active_phase_values) / len(active_phase_values)
+
+
+def _latest_samples(payload: dict[str, Any]) -> list[dict[str, Any]]:
+    meter_values = [
+        meter_value
+        for meter_value in payload.get("meterValue", [])
+        if isinstance(meter_value, dict)
+    ]
+    if not meter_values:
+        return []
+    return [
+        sample
+        for sample in meter_values[-1].get("sampledValue", [])
+        if isinstance(sample, dict)
+    ]
+
+
 def _values_by_phase(samples: list[dict[str, Any]], measurand: str) -> dict[str, float]:
     values: dict[str, float] = {}
     for sample in samples:
         if sample.get("measurand") != measurand:
             continue
         try:
-            values[str(sample.get("phase", ""))] = float(sample["value"])
+            value = float(sample["value"])
         except (KeyError, TypeError, ValueError):
             continue
+        if math.isfinite(value):
+            values[str(sample.get("phase", ""))] = value
     return values
 
 

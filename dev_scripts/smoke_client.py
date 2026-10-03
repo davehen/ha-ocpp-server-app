@@ -28,6 +28,7 @@ async def receive_command(websocket, expected_action: str) -> list[object]:
 async def run(bridge_host: str, mqtt_host: str) -> None:
     """Exercise one boot, current command, and meter-value round trip."""
     current_received = threading.Event()
+    measured_current_received = threading.Event()
     power_received = threading.Event()
     subscribed = threading.Event()
 
@@ -37,6 +38,7 @@ async def run(bridge_host: str, mqtt_host: str) -> None:
         client.subscribe(
             [
                 ("evbox_elvi/maximum_current/state", 1),
+                ("evbox_elvi/current_import/state", 1),
                 ("evbox_elvi/power_active_import/state", 1),
             ]
         )
@@ -48,6 +50,8 @@ async def run(bridge_host: str, mqtt_host: str) -> None:
         payload = message.payload.decode()
         if message.topic == "evbox_elvi/maximum_current/state" and payload == "5":
             current_received.set()
+        if message.topic == "evbox_elvi/current_import/state" and payload == "10.000":
+            measured_current_received.set()
         if message.topic == "evbox_elvi/power_active_import/state" and payload == "2.300":
             power_received.set()
 
@@ -119,7 +123,12 @@ async def run(bridge_host: str, mqtt_host: str) -> None:
                                             "value": "2300",
                                             "measurand": "Power.Active.Import",
                                             "unit": "W",
-                                        }
+                                        },
+                                        {
+                                            "value": "10",
+                                            "measurand": "Current.Import",
+                                            "unit": "A",
+                                        },
                                     ],
                                 }
                             ],
@@ -131,6 +140,8 @@ async def run(bridge_host: str, mqtt_host: str) -> None:
             assert meter_response == [3, "meter-1", {}]
             if not await asyncio.to_thread(power_received.wait, 5):
                 raise TimeoutError("2.300 kW meter value was not published through MQTT")
+            if not await asyncio.to_thread(measured_current_received.wait, 5):
+                raise TimeoutError("10.000 A meter value was not published through MQTT")
     finally:
         mqtt_client.disconnect()
         mqtt_client.loop_stop()

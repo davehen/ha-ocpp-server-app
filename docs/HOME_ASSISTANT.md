@@ -32,14 +32,19 @@ MQTT Discovery requests these exact entity IDs:
 | `switch.charger_charge_control` | Remotely start and stop a charging session |
 | `switch.charger_availability` | Free/occupied state and operative availability |
 | `number.charger_maximum_current` | Current limit accepted by the Elvi |
+| `sensor.charger_current_import` | Instantaneous measured charging current in A |
 | `sensor.charger_power_active_import` | Instantaneous charging power in kW |
 
-The `lovelace/vehicles_card.yaml` dashboard, `Safely apply current on charger`,
-and the `Adapt charging power` logic use these names.
+The existing dashboard and charging automations continue to use the preserved
+control, limit, and power IDs. The exported Home Assistant registry confirms
+that `sensor.charger_current_import` was also provided by the old OCPP
+integration, although the active YAML does not currently reference it.
 
-The number holds the commanded limit, not measured instantaneous current. The
-power sensor uses `Power.Active.Import`, or falls back to current, voltage, and
-the configured number of phases.
+The number holds the commanded limit, while `sensor.charger_current_import`
+comes from the latest OCPP `Current.Import` sample. An unphased sample is used
+directly; when the Elvi reports individual phases, the sensor is the average of
+the active phases. The power sensor uses `Power.Active.Import`, or falls back to
+current, voltage, and the configured number of phases.
 
 ## Add the repository
 
@@ -96,7 +101,7 @@ Internet.
 
 Home Assistant stores internal entity-registry IDs in device-based automation
 blocks, not only the visible `entity_id`. The new MQTT entities can reuse the
-four names above, but they cannot inherit the internal IDs belonging to the
+five names above, but they cannot inherit the internal IDs belonging to the
 removed OCPP integration.
 
 Static inspection of `davehomeassistant` found four blocks that must be
@@ -168,7 +173,7 @@ device-based actions with entity actions.
 4. Temporarily disable `Safely apply current on charger`, `Adapt charging
    power`, and `Auto-start charging`.
 5. Install and configure the add-on without starting it.
-6. Stop and remove the old OCPP integration config entry so the four entity IDs
+6. Stop and remove the old OCPP integration config entry so the five entity IDs
    become free.
 7. Confirm that no other process is using TCP port 9000.
 8. Start the add-on.
@@ -182,7 +187,7 @@ device-based actions with entity actions.
     response.
 11. Copy the ID from the log into `expected_charge_point_id`, save, and restart
     the add-on.
-12. Confirm that the four entities were created without numeric suffixes.
+12. Confirm that the five entities were created without numeric suffixes.
 
 A name such as `sensor.charger_power_active_import_2` means an old entity still
 owns the required ID. Do not continue until that conflict has been resolved.
@@ -200,10 +205,10 @@ Run this test under direct supervision.
 5. Set 6 A, 8 A, and 12 A. For each value, confirm:
    - an accepted `SetChargingProfile`;
    - an updated `number.charger_maximum_current`;
-   - consistent physical current;
+   - a consistent measured value in `sensor.charger_current_import`;
    - an updated `sensor.charger_power_active_import`.
 6. Set 5 A and confirm the suspension behavior used by the solar automation and
-   power falling to zero.
+   measured current and power falling to zero.
 7. Restore 12 A.
 8. Stop the session and verify `RemoteStopTransaction`, charge control `off`,
    and power at zero.
@@ -224,6 +229,8 @@ setpoint with the add-on log, the number state, and the Elvi's physical current.
 ## Failure behavior
 
 - When the wallbox disconnects, MQTT entities become unavailable.
+- Measured current is published only when the Elvi sends `Current.Import`; its
+  normal update cadence is therefore `meter_value_interval`.
 - A new current limit is published only after the Elvi accepts
   `SetChargingProfile`.
 - A rejection or timeout preserves the previous value, allowing the automation
@@ -240,7 +247,7 @@ setpoint with the add-on log, the number state, and the Elvi's physical current.
 2. Stop the add-on.
 3. Restore the old integration and its configuration, or restore the complete
    backup.
-4. Confirm that the four original OCPP entities return.
+4. Confirm that the five original OCPP entities return.
 5. Restore the original device-based blocks if necessary.
 6. Manually test start, current adjustment, and stop.
 7. Re-enable automations only after the manual test succeeds.

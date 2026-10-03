@@ -71,14 +71,17 @@ the following end-to-end behavior:
 - use of `TxDefaultProfile` with a `5.0` limit;
 - publication of the accepted limit to
   `evbox_elvi/maximum_current/state`;
-- submission of `MeterValues` with `Power.Active.Import = 2300 W`;
+- submission of `MeterValues` with `Power.Active.Import = 2300 W` and
+  `Current.Import = 10 A`;
 - publication of `2.300` to
-  `evbox_elvi/power_active_import/state`.
+  `evbox_elvi/power_active_import/state`;
+- publication of `10.000` to `evbox_elvi/current_import/state`.
 
 The unit tests additionally cover remote start and stop, transaction IDs,
 connector state, suspension, rejected profiles, the current-and-voltage power
-fallback, OCPP response correlation, MeterValues configuration, and the exact
-required entity IDs.
+fallback, aggregate and per-phase measured current, invalid meter samples, OCPP
+response correlation, MeterValues configuration, and the exact required entity
+IDs and Discovery metadata.
 
 The mock doesn't communicate with the real Elvi, modify Home Assistant, or
 expose ports to the LAN.

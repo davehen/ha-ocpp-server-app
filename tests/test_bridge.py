@@ -4,7 +4,7 @@ import unittest
 from pathlib import Path
 from typing import Any
 
-from app.bridge import BridgeController, extract_power_kw
+from app.bridge import BridgeController, extract_current_a, extract_power_kw
 from app.config import Config
 from app.mqtt import MqttBridge
 from app.state import PersistentState
@@ -37,6 +37,9 @@ class FakeMqtt:
 
     def publish_power(self, kilowatts: float) -> None:
         self.values["power"] = kilowatts
+
+    def publish_current(self, amperes: float) -> None:
+        self.values["current"] = amperes
 
     def publish_maximum_current(self, amperes: float) -> None:
         self.values["maximum_current"] = amperes
@@ -124,12 +127,37 @@ class BridgeControllerTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(self.mqtt.values["charge_control"])
 
         self.mqtt.values["power"] = 2.5
+        self.mqtt.values["current"] = 8.0
         await self.bridge.handle_ocpp_call(
             "StatusNotification",
             {"connectorId": 1, "status": "SuspendedEVSE", "errorCode": "NoError"},
         )
         self.assertTrue(self.mqtt.values["charge_control"])
         self.assertEqual(self.mqtt.values["power"], 0)
+        self.assertEqual(self.mqtt.values["current"], 0)
+
+    async def test_meter_values_publish_measured_current_and_power(self) -> None:
+        await self.bridge.handle_ocpp_call(
+            "MeterValues",
+            {
+                "connectorId": 1,
+                "meterValue": [
+                    {
+                        "sampledValue": [
+                            {"value": "10", "measurand": "Current.Import", "unit": "A"},
+                            {
+                                "value": "2300",
+                                "measurand": "Power.Active.Import",
+                                "unit": "W",
+                            },
+                        ]
+                    }
+                ],
+            },
+        )
+
+        self.assertEqual(self.mqtt.values["current"], 10.0)
+        self.assertEqual(self.mqtt.values["power"], 2.3)
 
     async def test_current_command_uses_elvi_tx_default_profile(self) -> None:
         await self.bridge.attach(self.connection)  # type: ignore[arg-type]
@@ -279,6 +307,72 @@ class PowerExtractionTests(unittest.TestCase):
             ]
         }
         self.assertAlmostEqual(extract_power_kw(payload, number_of_phases=3), 2.0)
+
+
+class CurrentExtractionTests(unittest.TestCase):
+    def test_prefers_unphased_current_import(self) -> None:
+        payload = {
+            "meterValue": [
+                {
+                    "sampledValue": [
+                        {"value": "11.2", "measurand": "Current.Import", "unit": "A"},
+                        {
+                            "value": "7",
+                            "measurand": "Current.Import",
+                            "phase": "L1",
+                            "unit": "A",
+                        },
+                    ]
+                }
+            ]
+        }
+        self.assertAlmostEqual(extract_current_a(payload), 11.2)
+
+    def test_averages_only_active_phase_currents(self) -> None:
+        payload = {
+            "meterValue": [
+                {
+                    "sampledValue": [
+                        {"value": "9", "measurand": "Current.Import", "phase": "L1"},
+                        {"value": "10", "measurand": "Current.Import", "phase": "L2"},
+                        {"value": "11", "measurand": "Current.Import", "phase": "L3"},
+                    ]
+                }
+            ]
+        }
+        self.assertAlmostEqual(extract_current_a(payload), 10.0)
+
+        payload["meterValue"][0]["sampledValue"][1]["value"] = "0"
+        payload["meterValue"][0]["sampledValue"][2]["value"] = "0"
+        self.assertAlmostEqual(extract_current_a(payload), 9.0)
+
+    def test_all_zero_phases_publish_zero(self) -> None:
+        payload = {
+            "meterValue": [
+                {
+                    "sampledValue": [
+                        {"value": "0", "measurand": "Current.Import", "phase": "L1"},
+                        {"value": "0", "measurand": "Current.Import", "phase": "L2"},
+                        {"value": "0", "measurand": "Current.Import", "phase": "L3"},
+                    ]
+                }
+            ]
+        }
+        self.assertEqual(extract_current_a(payload), 0.0)
+
+    def test_uses_latest_meter_value_and_ignores_invalid_samples(self) -> None:
+        payload = {
+            "meterValue": [
+                {"sampledValue": [{"value": "6", "measurand": "Current.Import"}]},
+                {
+                    "sampledValue": [
+                        {"value": "nan", "measurand": "Current.Import"},
+                        {"value": "7000", "measurand": "Current.Import", "unit": "mA"},
+                    ]
+                },
+            ]
+        }
+        self.assertIsNone(extract_current_a(payload))
 
 
 if __name__ == "__main__":
