@@ -110,7 +110,7 @@ class MqttBridge:
             "device": device,
             "origin": {
                 "name": "EVBox Elvi OCPP bridge",
-                "sw_version": "1.2.0",
+                "sw_version": "1.2.1",
                 "support_url": "https://github.com/davehen/ha-ocpp-server-app",
             },
             "qos": 1,

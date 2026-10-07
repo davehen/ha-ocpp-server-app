@@ -40,7 +40,7 @@ docker build \
     --pull \
     --build-arg "BUILD_FROM=${build_from}" \
     --build-arg "BUILD_ARCH=${build_arch}" \
-    --build-arg "BUILD_VERSION=1.2.0" \
+    --build-arg "BUILD_VERSION=1.2.1" \
     --tag "${image_name}" \
     evbox_elvi_ocpp
 

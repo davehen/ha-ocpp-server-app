@@ -83,7 +83,8 @@ the following end-to-end behavior:
 - publication of the accepted dynamic limit to
   `evbox_elvi/maximum_current/state`.
 
-The unit tests additionally cover remote start and stop, transaction IDs,
+The unit tests additionally cover availability after reconnection without
+BootNotification, remote start and stop, transaction IDs,
 connector state, suspension, rejected active and default profiles, dynamic
 transaction-profile construction, command-error logging, the current-and-voltage power fallback,
 aggregate and per-phase measured current, invalid meter samples, OCPP response

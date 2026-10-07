@@ -100,6 +100,26 @@ class BridgeControllerTests(unittest.IsolatedAsyncioTestCase):
         self.bridge = BridgeController(self.config, self.mqtt, store)  # type: ignore[arg-type]
         self.connection = FakeConnection()
 
+    async def test_reconnect_without_boot_notification_restores_availability(self) -> None:
+        self.bridge.start()
+        self.assertFalse(self.mqtt.values["online"])
+        await self.bridge.attach(self.connection)  # type: ignore[arg-type]
+        self.assertTrue(self.mqtt.values["online"])
+
+        self.bridge.detach(self.connection)  # type: ignore[arg-type]
+        self.assertFalse(self.mqtt.values["online"])
+
+        replacement = FakeConnection()
+        await self.bridge.attach(replacement)  # type: ignore[arg-type]
+        await self.bridge.handle_ocpp_call("Heartbeat", {})
+        self.assertTrue(self.mqtt.values["online"])
+
+        # Cleanup of the old socket must not mark the new connection offline.
+        self.bridge.detach(self.connection)  # type: ignore[arg-type]
+        self.assertTrue(self.mqtt.values["online"])
+        self.bridge.detach(replacement)  # type: ignore[arg-type]
+        self.assertFalse(self.mqtt.values["online"])
+
     async def test_boot_and_status_publish_expected_states(self) -> None:
         await self.bridge.attach(self.connection)  # type: ignore[arg-type]
 

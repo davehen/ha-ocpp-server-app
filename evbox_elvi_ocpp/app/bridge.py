@@ -71,7 +71,7 @@ class BridgeController:
         self._status = "Unavailable"
         self._charge_control = False
         self._transaction_id = None
-        self._mqtt.publish_charger_online(False)
+        self._mqtt.publish_charger_online(True)
         if previous is not None and previous is not connection and not previous.closed:
             LOGGER.warning("Replacing an existing OCPP connection")
             await previous.close(code=1012, reason="Reconnected")

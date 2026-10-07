@@ -1,5 +1,11 @@
 # Changelog
 
+## 1.2.1
+
+- Publish MQTT availability as online when an OCPP connection is accepted,
+  including reconnections without BootNotification. Publish offline when the
+  active connection closes.
+
 ## 1.2.0
 
 - Apply current changes to an active transaction with a transaction-bound

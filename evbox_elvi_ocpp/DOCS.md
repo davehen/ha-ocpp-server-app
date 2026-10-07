@@ -150,8 +150,9 @@ charging and preserve a Home Assistant backup.
 6. Start this app. The wallbox URL remains
    `ws://<home-assistant-ip>:9000/<charge-point-id>` and therefore should not
    need to change.
-7. Confirm in the app log that the wallbox connects, sends `BootNotification`,
-   and receives an accepted response.
+7. Confirm in the app log that the wallbox connects and verify that
+   `evbox_elvi/availability` becomes `online`. A reconnecting Elvi may send
+   `Heartbeat` or `MeterValues` without a new `BootNotification`.
 8. Confirm that all five entity IDs in the table exist without a numeric suffix.
    A suffix such as `_2` means an old entity still owns the required ID; stop
    here and resolve the registry conflict.

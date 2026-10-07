@@ -41,7 +41,7 @@ docker build \
   --pull \
   --build-arg BUILD_FROM=ghcr.io/home-assistant/aarch64-base-python:3.13-alpine3.21-2025.11.1 \
   --build-arg BUILD_ARCH=aarch64 \
-  --build-arg BUILD_VERSION=1.2.0 \
+  --build-arg BUILD_VERSION=1.2.1 \
   --tag evbox-elvi-ocpp:test \
   evbox_elvi_ocpp
 ```
@@ -131,8 +131,9 @@ The charge point ID is the final URL segment. To find the Mac Wi-Fi address:
 ipconfig getifaddr en0
 ```
 
-The bridge log must show the connection, `BootNotification`, and an `Accepted`
-response. After confirming the ID, recreate the container with
+The bridge log must show the accepted OCPP connection. A reconnecting Elvi may
+resume with `Heartbeat` or `MeterValues` without sending `BootNotification`;
+MQTT availability becomes `online` in either case. After confirming the ID, recreate the container with
 `EXPECTED_CHARGE_POINT_ID` set to that value. This rejects clients using a
 different ID, but it is not authentication: never expose port 9000 to the
 Internet.
@@ -150,7 +151,7 @@ The primary state topics are:
 
 | Topic | Meaning |
 | --- | --- |
-| `evbox_elvi/availability` | `online` after an accepted `BootNotification` |
+| `evbox_elvi/availability` | `online` while an accepted OCPP connection is active; `offline` on disconnect |
 | `evbox_elvi/charge_control/state` | Charging-session state |
 | `evbox_elvi/charger_availability/state` | `ON` when the connector is free; `OFF` when occupied or unavailable |
 | `evbox_elvi/maximum_current/state` | Last current limit accepted by the Elvi |
@@ -200,7 +201,7 @@ publishes the average of the active phases. Power comes from
 `Power.Active.Import`, or is derived from current and voltage when that
 measurand is absent.
 
-Version 1.2.0 doesn't yet publish separate sensors for cumulative energy or
+Version 1.2.1 doesn't yet publish separate sensors for cumulative energy or
 session energy. Do not treat `maximum_current/state` as an
 instantaneous-current measurement.
 
@@ -306,7 +307,7 @@ docker exec evbox-test-mqtt mosquitto_pub -h localhost \
 ## Recommended test sequence
 
 1. Start the broker and bridge without a vehicle connected.
-2. Connect the Elvi and verify `BootNotification`.
+2. Connect the Elvi and verify that `evbox_elvi/availability` becomes `online`.
 3. Check availability `ON`, charge control `OFF`, and power `0.000`.
 4. Connect the vehicle and verify availability `OFF`.
 5. Start the charging session.

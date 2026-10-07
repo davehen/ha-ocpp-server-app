@@ -183,8 +183,9 @@ device-based actions with entity actions.
    ws://<HOME-ASSISTANT-IP>:9000/<CHARGE-POINT-ID>
    ```
 
-10. Check the log for the connection, `BootNotification`, and an `Accepted`
-    response.
+10. Check the log for the accepted OCPP connection and verify that
+    `evbox_elvi/availability` is `online`. The Elvi may resume with `Heartbeat`
+    or `MeterValues` without a new `BootNotification`.
 11. Copy the ID from the log into `expected_charge_point_id`, save, and restart
     the add-on.
 12. Confirm that the five entities were created without numeric suffixes.
@@ -193,6 +194,11 @@ A name such as `sensor.charger_power_active_import_2` means an old entity still
 owns the required ID. Do not continue until that conflict has been resolved.
 
 ## Functional validation
+
+When updating an existing installation to 1.2.1, update and restart the add-on,
+then wait for the Elvi to reconnect. Verify that `evbox_elvi/availability` is
+`online` and the five charger entities are available. No entity recreation or
+MQTT broker changes are required.
 
 Run this test under direct supervision.
 
