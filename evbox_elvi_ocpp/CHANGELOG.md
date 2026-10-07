@@ -1,5 +1,16 @@
 # Changelog
 
+## 1.2.0
+
+- Apply current changes to an active transaction with a transaction-bound
+  `TxProfile` instead of only updating the next transaction's default.
+- Keep `TxDefaultProfile` synchronized as a best-effort follow-up so the final
+  limit remains the default for the next charging session.
+- Extend the OCPP/MQTT smoke test to cover a dynamic current change during an
+  active transaction.
+- Log invalid or charger-rejected MQTT commands as concise warnings while
+  preserving error tracebacks for unexpected failures.
+
 ## 1.1.0
 
 - Publish measured `Current.Import` through MQTT Discovery as

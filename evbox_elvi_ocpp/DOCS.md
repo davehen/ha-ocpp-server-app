@@ -29,14 +29,16 @@ MQTT Discovery requests these exact IDs:
 | --- | --- |
 | `switch.charger_charge_control` | `RemoteStartTransaction` / `RemoteStopTransaction` |
 | `switch.charger_availability` | `ChangeAvailability` and `StatusNotification` |
-| `number.charger_maximum_current` | `SetChargingProfile` with `TxDefaultProfile` |
+| `number.charger_maximum_current` | `TxProfile` while charging; `TxDefaultProfile` while idle |
 | `sensor.charger_current_import` | Measured `Current.Import` in amperes |
 | `sensor.charger_power_active_import` | `Power.Active.Import`, with a current/voltage fallback |
 
-The current limit uses a connector-level `TxDefaultProfile`. This is
-intentional: EVBox Elvi rejects the station-level `ChargePointMaxProfile` used
-by some OCPP implementations, while `TxDefaultProfile` is the established Elvi
-compatibility path and can be installed before a transaction starts.
+Before a transaction starts, the current limit uses a connector-level
+`TxDefaultProfile`. During an active transaction, the app first sends a
+higher-stack `TxProfile` containing the Elvi's current `transactionId`; this is
+the profile that applies to the active transaction. After that profile is
+accepted, the app also updates `TxDefaultProfile` as a best-effort follow-up so
+the same limit applies to the next transaction.
 
 ## Configuration
 
@@ -161,10 +163,11 @@ charging and preserve a Home Assistant backup.
 11. Manually start charging from the charge-control switch. Confirm the app log
     shows an accepted `RemoteStartTransaction`, then a `StartTransaction` and
     charging `StatusNotification` from the Elvi.
-12. Set 6 A, 8 A, and 12 A one at a time. For every value, confirm an accepted
-    `SetChargingProfile`, the number state update, the expected physical
-    current, and a consistent `sensor.charger_current_import`. Also verify that
-    5 A produces the existing suspended behavior used by the solar automation.
+12. During the active transaction, set 6 A, 8 A, and 12 A one at a time. For
+    every value, confirm an accepted transaction-bound `TxProfile`, the number
+    state update, and a matching physical change in
+    `sensor.charger_current_import`. Also verify that 5 A produces the existing
+    suspended behavior used by the solar automation.
 13. Stop charging and confirm an accepted `RemoteStopTransaction`, followed by
     zero measured current, zero power, and charge control `off`.
 14. Apply the device-to-entity automation replacements above. Validate the Home
@@ -180,9 +183,12 @@ charging and preserve a Home Assistant backup.
   are rejected and retained entity states are not presented as live.
 - Measured current updates only when the Elvi sends `Current.Import`, normally
   at the configured `meter_value_interval`.
-- A current value is published only after the Elvi accepts
-  `SetChargingProfile`. Rejected or timed-out commands leave the previous value
-  unchanged, allowing the existing watchdog automation to try again later.
+- While charging, a current value is published only after the Elvi accepts the
+  transaction-bound `TxProfile`. A rejection or timeout leaves the previous
+  value unchanged, allowing the existing watchdog automation to try again.
+- After an active `TxProfile` is accepted, failure to update the best-effort
+  `TxDefaultProfile` is logged but does not misreport the active command as
+  failed.
 - A stop command is not fabricated when no OCPP transaction ID is known. The
   app logs the failure and leaves the switch state unchanged.
 - Invalid or unsupported charge-point calls receive an OCPP error response;

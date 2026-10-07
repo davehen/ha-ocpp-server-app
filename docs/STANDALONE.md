@@ -41,7 +41,7 @@ docker build \
   --pull \
   --build-arg BUILD_FROM=ghcr.io/home-assistant/aarch64-base-python:3.13-alpine3.21-2025.11.1 \
   --build-arg BUILD_ARCH=aarch64 \
-  --build-arg BUILD_VERSION=1.1.0 \
+  --build-arg BUILD_VERSION=1.2.0 \
   --tag evbox-elvi-ocpp:test \
   evbox_elvi_ocpp
 ```
@@ -167,6 +167,32 @@ docker exec -it evbox-test-mqtt mosquitto_sub -h localhost -v \
   -t evbox_elvi/power_active_import/state
 ```
 
+To read only the latest retained value and exit, use these one-shot commands.
+They query the standalone MQTT broker directly; Home Assistant is not involved:
+
+```shell
+# Measured charging current in A
+docker exec evbox-test-mqtt \
+  mosquitto_sub -h localhost -C 1 -W 2 \
+  -t evbox_elvi/current_import/state
+
+# Measured charging power in kW
+docker exec evbox-test-mqtt \
+  mosquitto_sub -h localhost -C 1 -W 2 \
+  -t evbox_elvi/power_active_import/state
+
+# Current limit last accepted by the Elvi in A
+docker exec evbox-test-mqtt \
+  mosquitto_sub -h localhost -C 1 -W 2 \
+  -t evbox_elvi/maximum_current/state
+```
+
+`-C 1` exits after the first value and `-W 2` stops waiting after two seconds
+if no retained value is available. The measured current and power are the
+latest samples received from the Elvi, not active OCPP queries. Their age is
+therefore limited by the configured `MeterValues` interval, normally 60
+seconds in this standalone setup.
+
 The maximum-current number is the commanded and accepted limit, not the
 instantaneous measurement. `current_import/state` comes from the latest
 `Current.Import` sample. If the Elvi reports one value per phase, the bridge
@@ -174,7 +200,7 @@ publishes the average of the active phases. Power comes from
 `Power.Active.Import`, or is derived from current and voltage when that
 measurand is absent.
 
-Version 1.1.0 doesn't yet publish separate sensors for cumulative energy or
+Version 1.2.0 doesn't yet publish separate sensors for cumulative energy or
 session energy. Do not treat `maximum_current/state` as an
 instantaneous-current measurement.
 
@@ -195,11 +221,17 @@ These are all the public MQTT commands implemented by the bridge:
 | `evbox_elvi/charge_control/set` | `OFF` | `RemoteStopTransaction` |
 | `evbox_elvi/charger_availability/set` | `ON` | `ChangeAvailability: Operative` |
 | `evbox_elvi/charger_availability/set` | `OFF` | `ChangeAvailability: Inoperative` |
-| `evbox_elvi/maximum_current/set` | number | `SetChargingProfile: TxDefaultProfile` |
+| `evbox_elvi/maximum_current/set` | number | Idle: `TxDefaultProfile`; active transaction: `TxProfile` plus a best-effort default update |
 
 The current limit must be finite and between 0 and `MAXIMUM_CURRENT`. The Elvi
 may reject values unsupported by its firmware. A value of 5 A is allowed to
 preserve the suspension behavior used by the solar automation.
+
+When no transaction ID is known, the command sets the connector's
+`TxDefaultProfile`. During a transaction, it first sends a higher-stack
+`TxProfile` bound to that transaction ID so the limit applies to the active
+session. Only after that profile is accepted does it update the default for the
+next session.
 
 ### Adjust the current limit
 
@@ -218,9 +250,9 @@ docker exec evbox-test-mqtt mosquitto_pub -h localhost \
 
 For every command, verify:
 
-1. an accepted `SetChargingProfile` in the log;
+1. an accepted transaction-bound `TxProfile` in the log while charging;
 2. an updated `maximum_current/state`;
-3. a consistent `current_import/state` measurement and physical current;
+3. a corresponding change in `current_import/state` and physical current;
 4. consistent measured power.
 
 Test 5 A only after the normal values:

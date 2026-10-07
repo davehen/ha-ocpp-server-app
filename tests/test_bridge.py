@@ -6,7 +6,7 @@ from typing import Any
 
 from app.bridge import BridgeController, extract_current_a, extract_power_kw
 from app.config import Config
-from app.mqtt import MqttBridge
+from app.mqtt import InvalidMqttCommand, MqttBridge, MqttCommandRejected
 from app.state import PersistentState
 
 
@@ -53,9 +53,13 @@ class FakeConnection:
         self.closed = False
         self.calls: list[tuple[str, dict[str, Any]]] = []
         self.responses: dict[str, dict[str, Any]] = {}
+        self.response_sequences: dict[str, list[dict[str, Any]]] = {}
 
     async def call(self, action: str, payload: dict[str, Any]) -> dict[str, Any]:
         self.calls.append((action, payload))
+        sequence = self.response_sequences.get(action)
+        if sequence:
+            return sequence.pop(0)
         return self.responses.get(action, {"status": "Accepted"})
 
     async def close(self, code: int = 1000, reason: str = "") -> None:
@@ -159,7 +163,7 @@ class BridgeControllerTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(self.mqtt.values["current"], 10.0)
         self.assertEqual(self.mqtt.values["power"], 2.3)
 
-    async def test_current_command_uses_elvi_tx_default_profile(self) -> None:
+    async def test_idle_current_command_uses_tx_default_profile(self) -> None:
         await self.bridge.attach(self.connection)  # type: ignore[arg-type]
 
         await self.bridge.handle_mqtt_command("evbox_elvi/maximum_current/set", "8.5")
@@ -168,13 +172,53 @@ class BridgeControllerTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(action, "SetChargingProfile")
         self.assertEqual(payload["connectorId"], 1)
         profile = payload["csChargingProfiles"]
+        self.assertEqual(profile["chargingProfileId"], 2001)
+        self.assertEqual(profile["stackLevel"], 0)
         self.assertEqual(profile["chargingProfilePurpose"], "TxDefaultProfile")
         self.assertEqual(profile["chargingProfileKind"], "Relative")
+        self.assertNotIn("transactionId", profile)
         self.assertEqual(
             profile["chargingSchedule"]["chargingSchedulePeriod"],
             [{"startPeriod": 0, "limit": 8.5}],
         )
         self.assertEqual(self.mqtt.values["maximum_current"], 8.5)
+
+    async def test_active_current_command_uses_transaction_profile_then_default(self) -> None:
+        await self.bridge.attach(self.connection)  # type: ignore[arg-type]
+        start_response = await self.bridge.handle_ocpp_call(
+            "StartTransaction",
+            {
+                "connectorId": 1,
+                "idTag": "HomeAssistant",
+                "meterStart": 10,
+                "timestamp": "now",
+            },
+        )
+
+        await self.bridge.handle_mqtt_command("evbox_elvi/maximum_current/set", "8")
+
+        self.assertEqual(len(self.connection.calls), 2)
+        active_action, active_payload = self.connection.calls[0]
+        self.assertEqual(active_action, "SetChargingProfile")
+        self.assertEqual(active_payload["connectorId"], 1)
+        active_profile = active_payload["csChargingProfiles"]
+        self.assertEqual(active_profile["chargingProfileId"], 2002)
+        self.assertEqual(active_profile["stackLevel"], 1)
+        self.assertEqual(active_profile["chargingProfilePurpose"], "TxProfile")
+        self.assertEqual(active_profile["transactionId"], start_response["transactionId"])
+        self.assertEqual(
+            active_profile["chargingSchedule"]["chargingSchedulePeriod"],
+            [{"startPeriod": 0, "limit": 8.0}],
+        )
+
+        default_action, default_payload = self.connection.calls[1]
+        self.assertEqual(default_action, "SetChargingProfile")
+        default_profile = default_payload["csChargingProfiles"]
+        self.assertEqual(default_profile["chargingProfileId"], 2001)
+        self.assertEqual(default_profile["stackLevel"], 0)
+        self.assertEqual(default_profile["chargingProfilePurpose"], "TxDefaultProfile")
+        self.assertNotIn("transactionId", default_profile)
+        self.assertEqual(self.mqtt.values["maximum_current"], 8.0)
 
     async def test_five_amp_pause_value_is_forwarded_unchanged(self) -> None:
         await self.bridge.attach(self.connection)  # type: ignore[arg-type]
@@ -228,10 +272,56 @@ class BridgeControllerTests(unittest.IsolatedAsyncioTestCase):
         await self.bridge.attach(self.connection)  # type: ignore[arg-type]
         self.connection.responses["SetChargingProfile"] = {"status": "Rejected"}
 
-        with self.assertRaisesRegex(RuntimeError, "rejected SetChargingProfile"):
+        with self.assertRaisesRegex(
+            RuntimeError,
+            r"rejected SetChargingProfile\(TxDefaultProfile\)",
+        ):
             await self.bridge.handle_mqtt_command("evbox_elvi/maximum_current/set", "7")
 
         self.assertNotIn("maximum_current", self.mqtt.values)
+
+    async def test_rejected_active_transaction_profile_is_not_reported_as_applied(self) -> None:
+        await self.bridge.attach(self.connection)  # type: ignore[arg-type]
+        await self.bridge.handle_ocpp_call(
+            "StartTransaction",
+            {
+                "connectorId": 1,
+                "idTag": "HomeAssistant",
+                "meterStart": 10,
+                "timestamp": "now",
+            },
+        )
+        self.connection.responses["SetChargingProfile"] = {"status": "Rejected"}
+
+        with self.assertRaisesRegex(
+            RuntimeError,
+            r"rejected SetChargingProfile\(TxProfile\)",
+        ):
+            await self.bridge.handle_mqtt_command("evbox_elvi/maximum_current/set", "7")
+
+        self.assertEqual(len(self.connection.calls), 1)
+        self.assertNotIn("maximum_current", self.mqtt.values)
+
+    async def test_rejected_default_follow_up_does_not_undo_active_limit(self) -> None:
+        await self.bridge.attach(self.connection)  # type: ignore[arg-type]
+        await self.bridge.handle_ocpp_call(
+            "StartTransaction",
+            {
+                "connectorId": 1,
+                "idTag": "HomeAssistant",
+                "meterStart": 10,
+                "timestamp": "now",
+            },
+        )
+        self.connection.response_sequences["SetChargingProfile"] = [
+            {"status": "Accepted"},
+            {"status": "Rejected"},
+        ]
+
+        await self.bridge.handle_mqtt_command("evbox_elvi/maximum_current/set", "7")
+
+        self.assertEqual(len(self.connection.calls), 2)
+        self.assertEqual(self.mqtt.values["maximum_current"], 7.0)
 
     async def test_remote_start_and_stop_use_wallbox_transaction(self) -> None:
         await self.bridge.attach(self.connection)  # type: ignore[arg-type]
@@ -257,6 +347,22 @@ class BridgeControllerTests(unittest.IsolatedAsyncioTestCase):
             ("RemoteStopTransaction", {"transactionId": start_response["transactionId"]}),
         )
         self.assertFalse(self.mqtt.values["charge_control"])
+
+    async def test_invalid_charge_control_payload_is_an_expected_command_error(self) -> None:
+        with self.assertRaisesRegex(InvalidMqttCommand, "Invalid charge-control payload"):
+            await self.bridge.handle_mqtt_command(
+                "evbox_elvi/charge_control/set",
+                "ONbh",
+            )
+
+    async def test_rejected_remote_start_is_an_expected_command_error(self) -> None:
+        await self.bridge.attach(self.connection)  # type: ignore[arg-type]
+        self.connection.responses["RemoteStartTransaction"] = {"status": "Rejected"}
+
+        with self.assertRaisesRegex(MqttCommandRejected, "rejected RemoteStartTransaction"):
+            await self.bridge.handle_mqtt_command("evbox_elvi/charge_control/set", "ON")
+
+        self.assertNotIn("charge_control", self.mqtt.values)
 
 
 class PowerExtractionTests(unittest.TestCase):

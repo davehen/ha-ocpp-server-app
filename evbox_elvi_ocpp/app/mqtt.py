@@ -14,6 +14,14 @@ LOGGER = logging.getLogger(__name__)
 CommandHandler = Callable[[str, str], Awaitable[None]]
 
 
+class InvalidMqttCommand(ValueError):
+    """An MQTT command whose topic or payload is invalid."""
+
+
+class MqttCommandRejected(RuntimeError):
+    """An otherwise valid MQTT command rejected by the charger."""
+
+
 class MqttBridge:
     """Publish charger entities and forward MQTT commands to the bridge."""
 
@@ -102,7 +110,7 @@ class MqttBridge:
             "device": device,
             "origin": {
                 "name": "EVBox Elvi OCPP bridge",
-                "sw_version": "1.1.0",
+                "sw_version": "1.2.0",
                 "support_url": "https://github.com/davehen/ha-ocpp-server-app",
             },
             "qos": 1,
@@ -295,5 +303,7 @@ class MqttBridge:
     def _log_command_failure(future: Any) -> None:
         try:
             future.result()
+        except (InvalidMqttCommand, MqttCommandRejected) as exc:
+            LOGGER.warning("MQTT command rejected: %s", exc)
         except Exception:
             LOGGER.exception("MQTT command failed")

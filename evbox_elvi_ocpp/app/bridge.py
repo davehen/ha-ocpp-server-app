@@ -10,7 +10,7 @@ from datetime import UTC, datetime
 from typing import Any
 
 from .config import Config
-from .mqtt import MqttBridge
+from .mqtt import InvalidMqttCommand, MqttBridge, MqttCommandRejected
 from .ocpp import OcppConnection, OcppNotSupportedError
 from .state import StateStore
 
@@ -125,17 +125,25 @@ class BridgeController:
                 elif payload.upper() == "OFF":
                     await self._stop_charging()
                 else:
-                    raise ValueError(f"Invalid charge-control payload: {payload!r}")
+                    raise InvalidMqttCommand(
+                        f"Invalid charge-control payload: {payload!r}"
+                    )
                 return
             if topic == self._mqtt.topic(f"{MqttBridge.CHARGER_AVAILABILITY}/set"):
                 if payload.upper() not in {"ON", "OFF"}:
-                    raise ValueError(f"Invalid availability payload: {payload!r}")
+                    raise InvalidMqttCommand(f"Invalid availability payload: {payload!r}")
                 await self._set_availability(payload.upper() == "ON")
                 return
             if topic == self._mqtt.topic(f"{MqttBridge.MAXIMUM_CURRENT}/set"):
-                await self._set_current(float(payload))
+                try:
+                    amperes = float(payload)
+                except ValueError:
+                    raise InvalidMqttCommand(
+                        f"Invalid maximum-current payload: {payload!r}"
+                    ) from None
+                await self._set_current(amperes)
                 return
-            raise ValueError(f"Unknown MQTT command topic: {topic}")
+            raise InvalidMqttCommand(f"Unknown MQTT command topic: {topic}")
 
     def _on_boot_notification(self, payload: dict[str, Any]) -> dict[str, Any]:
         self._mqtt.update_device_information(
@@ -285,19 +293,25 @@ class BridgeController:
             {"idTag": self._config.id_tag, "connectorId": 1},
         )
         if not _is_accepted(response):
-            raise RuntimeError(f"EVBox rejected RemoteStartTransaction: {response}")
+            raise MqttCommandRejected(
+                f"EVBox rejected RemoteStartTransaction: {response}"
+            )
         self._charge_control = True
         self._mqtt.publish_charge_control(True)
 
     async def _stop_charging(self) -> None:
         if self._transaction_id is None:
-            raise RuntimeError("Cannot stop charging before an OCPP transaction ID is known")
+            raise MqttCommandRejected(
+                "Cannot stop charging before an OCPP transaction ID is known"
+            )
         response = await self._require_connection().call(
             "RemoteStopTransaction",
             {"transactionId": self._transaction_id},
         )
         if not _is_accepted(response):
-            raise RuntimeError(f"EVBox rejected RemoteStopTransaction: {response}")
+            raise MqttCommandRejected(
+                f"EVBox rejected RemoteStopTransaction: {response}"
+            )
         self._charge_control = False
         self._mqtt.publish_charge_control(False)
 
@@ -307,32 +321,112 @@ class BridgeController:
             {"connectorId": 1, "type": "Operative" if available else "Inoperative"},
         )
         if not _is_accepted(response, accepted_values={"Accepted", "Scheduled"}):
-            raise RuntimeError(f"EVBox rejected ChangeAvailability: {response}")
+            raise MqttCommandRejected(f"EVBox rejected ChangeAvailability: {response}")
 
     async def _set_current(self, amperes: float) -> None:
         if not math.isfinite(amperes) or amperes < 0 or amperes > self._config.maximum_current:
-            raise ValueError(
+            raise InvalidMqttCommand(
                 f"Current must be between 0 and {self._config.maximum_current:g} A"
             )
-        profile = {
-            "chargingProfileId": 2001,
-            "stackLevel": 0,
-            "chargingProfilePurpose": "TxDefaultProfile",
+        transaction_id = self._transaction_id
+        if transaction_id is not None:
+            transaction_profile = self._current_profile(
+                amperes,
+                profile_id=2002,
+                purpose="TxProfile",
+                stack_level=1,
+                transaction_id=transaction_id,
+            )
+            response = await self._require_connection().call(
+                "SetChargingProfile",
+                {"connectorId": 1, "csChargingProfiles": transaction_profile},
+            )
+            if not _is_accepted(response):
+                raise MqttCommandRejected(
+                    f"EVBox rejected SetChargingProfile(TxProfile): {response}"
+                )
+            LOGGER.info(
+                "EVBox accepted %.1f A TxProfile for transaction %s",
+                amperes,
+                transaction_id,
+            )
+
+            # Keep the same limit as the default for the next transaction. The
+            # active TxProfile above is the critical command, so a charger that
+            # rejects this best-effort follow-up must not turn an already
+            # applied dynamic limit into a reported command failure.
+            try:
+                default_response = await self._require_connection().call(
+                    "SetChargingProfile",
+                    {
+                        "connectorId": 1,
+                        "csChargingProfiles": self._current_profile(
+                            amperes,
+                            profile_id=2001,
+                            purpose="TxDefaultProfile",
+                            stack_level=0,
+                        ),
+                    },
+                )
+                if not _is_accepted(default_response):
+                    LOGGER.warning(
+                        "EVBox accepted the active TxProfile but rejected the "
+                        "TxDefaultProfile for the next transaction: %s",
+                        default_response,
+                    )
+                else:
+                    LOGGER.info(
+                        "EVBox accepted %.1f A TxDefaultProfile for the next transaction",
+                        amperes,
+                    )
+            except Exception:
+                LOGGER.exception(
+                    "EVBox accepted the active TxProfile but the TxDefaultProfile "
+                    "update for the next transaction failed"
+                )
+        else:
+            default_profile = self._current_profile(
+                amperes,
+                profile_id=2001,
+                purpose="TxDefaultProfile",
+                stack_level=0,
+            )
+            response = await self._require_connection().call(
+                "SetChargingProfile",
+                {"connectorId": 1, "csChargingProfiles": default_profile},
+            )
+            if not _is_accepted(response):
+                raise MqttCommandRejected(
+                    f"EVBox rejected SetChargingProfile(TxDefaultProfile): {response}"
+                )
+            LOGGER.info("EVBox accepted %.1f A TxDefaultProfile", amperes)
+
+        self._store.state.maximum_current = amperes
+        self._store.save()
+        self._mqtt.publish_maximum_current(amperes)
+
+    @staticmethod
+    def _current_profile(
+        amperes: float,
+        *,
+        profile_id: int,
+        purpose: str,
+        stack_level: int,
+        transaction_id: int | None = None,
+    ) -> dict[str, Any]:
+        profile: dict[str, Any] = {
+            "chargingProfileId": profile_id,
+            "stackLevel": stack_level,
+            "chargingProfilePurpose": purpose,
             "chargingProfileKind": "Relative",
             "chargingSchedule": {
                 "chargingRateUnit": "A",
                 "chargingSchedulePeriod": [{"startPeriod": 0, "limit": amperes}],
             },
         }
-        response = await self._require_connection().call(
-            "SetChargingProfile",
-            {"connectorId": 1, "csChargingProfiles": profile},
-        )
-        if not _is_accepted(response):
-            raise RuntimeError(f"EVBox rejected SetChargingProfile: {response}")
-        self._store.state.maximum_current = amperes
-        self._store.save()
-        self._mqtt.publish_maximum_current(amperes)
+        if transaction_id is not None:
+            profile["transactionId"] = transaction_id
+        return profile
 
     def _require_connection(self) -> OcppConnection:
         connection = self._connection

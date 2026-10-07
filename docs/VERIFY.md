@@ -75,13 +75,20 @@ the following end-to-end behavior:
   `Current.Import = 10 A`;
 - publication of `2.300` to
   `evbox_elvi/power_active_import/state`;
-- publication of `10.000` to `evbox_elvi/current_import/state`.
+- publication of `10.000` to `evbox_elvi/current_import/state`;
+- creation of an OCPP transaction and assignment of its transaction ID;
+- an 8 A MQTT command during that active transaction;
+- receipt of a higher-stack `TxProfile` containing the matching transaction ID;
+- a following `TxDefaultProfile` update for the next transaction;
+- publication of the accepted dynamic limit to
+  `evbox_elvi/maximum_current/state`.
 
 The unit tests additionally cover remote start and stop, transaction IDs,
-connector state, suspension, rejected profiles, the current-and-voltage power
-fallback, aggregate and per-phase measured current, invalid meter samples, OCPP
-response correlation, MeterValues configuration, and the exact required entity
-IDs and Discovery metadata.
+connector state, suspension, rejected active and default profiles, dynamic
+transaction-profile construction, command-error logging, the current-and-voltage power fallback,
+aggregate and per-phase measured current, invalid meter samples, OCPP response
+correlation, MeterValues configuration, and the exact required entity IDs and
+Discovery metadata.
 
 The mock doesn't communicate with the real Elvi, modify Home Assistant, or
 expose ports to the LAN.

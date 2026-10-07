@@ -1,8 +1,9 @@
 import json
 import unittest
+from concurrent.futures import Future
 from types import SimpleNamespace
 
-from app.mqtt import MqttBridge
+from app.mqtt import InvalidMqttCommand, MqttBridge, MqttCommandRejected
 
 
 class MqttDiscoveryTests(unittest.TestCase):
@@ -37,6 +38,33 @@ class MqttDiscoveryTests(unittest.TestCase):
         self.assertEqual(payload["unit_of_measurement"], "A")
         self.assertEqual(payload["device_class"], "current")
         self.assertEqual(payload["state_class"], "measurement")
+
+
+class MqttCommandLoggingTests(unittest.TestCase):
+    def test_expected_command_error_is_a_warning_without_traceback(self) -> None:
+        for error in (
+            InvalidMqttCommand("invalid payload"),
+            MqttCommandRejected("charger rejected command"),
+        ):
+            with self.subTest(error=type(error).__name__):
+                future: Future[None] = Future()
+                future.set_exception(error)
+
+                with self.assertLogs("app.mqtt", level="WARNING") as logs:
+                    MqttBridge._log_command_failure(future)
+
+                self.assertEqual(logs.records[0].levelname, "WARNING")
+                self.assertIsNone(logs.records[0].exc_info)
+
+    def test_unexpected_command_error_keeps_error_traceback(self) -> None:
+        future: Future[None] = Future()
+        future.set_exception(OSError("connection lost"))
+
+        with self.assertLogs("app.mqtt", level="ERROR") as logs:
+            MqttBridge._log_command_failure(future)
+
+        self.assertEqual(logs.records[0].levelname, "ERROR")
+        self.assertIsNotNone(logs.records[0].exc_info)
 
 
 if __name__ == "__main__":

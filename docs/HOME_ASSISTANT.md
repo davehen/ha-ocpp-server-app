@@ -202,10 +202,11 @@ Run this test under direct supervision.
 3. Manually turn on `switch.charger_charge_control`.
 4. Check the log for `RemoteStartTransaction`, `StartTransaction`, and a
    charging `StatusNotification`.
-5. Set 6 A, 8 A, and 12 A. For each value, confirm:
-   - an accepted `SetChargingProfile`;
+5. During the active transaction, set 6 A, 8 A, and 12 A. For each value,
+   confirm:
+   - an accepted `TxProfile` containing the active transaction ID;
    - an updated `number.charger_maximum_current`;
-   - a consistent measured value in `sensor.charger_current_import`;
+   - a corresponding physical change in `sensor.charger_current_import`;
    - an updated `sensor.charger_power_active_import`.
 6. Set 5 A and confirm the suspension behavior used by the solar automation and
    measured current and power falling to zero.
@@ -231,10 +232,13 @@ setpoint with the add-on log, the number state, and the Elvi's physical current.
 - When the wallbox disconnects, MQTT entities become unavailable.
 - Measured current is published only when the Elvi sends `Current.Import`; its
   normal update cadence is therefore `meter_value_interval`.
-- A new current limit is published only after the Elvi accepts
-  `SetChargingProfile`.
-- A rejection or timeout preserves the previous value, allowing the automation
-  watchdog to retry.
+- During charging, a new current limit is published only after the Elvi accepts
+  a `TxProfile` bound to the active transaction ID.
+- A rejected or timed-out active profile preserves the previous value, allowing
+  the automation watchdog to retry.
+- The app then updates `TxDefaultProfile` as a best-effort default for the next
+  transaction; failure of this follow-up is logged without undoing the active
+  limit.
 - A stop is rejected when no transaction ID is known.
 - An unsupported OCPP action receives a `CALLERROR`.
 - Malformed JSON is ignored without stopping the server.

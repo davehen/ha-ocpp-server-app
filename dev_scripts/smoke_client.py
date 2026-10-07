@@ -27,7 +27,8 @@ async def receive_command(websocket, expected_action: str) -> list[object]:
 
 async def run(bridge_host: str, mqtt_host: str) -> None:
     """Exercise one boot, current command, and meter-value round trip."""
-    current_received = threading.Event()
+    default_current_received = threading.Event()
+    dynamic_current_received = threading.Event()
     measured_current_received = threading.Event()
     power_received = threading.Event()
     subscribed = threading.Event()
@@ -49,7 +50,9 @@ async def run(bridge_host: str, mqtt_host: str) -> None:
     def on_message(client, userdata, message) -> None:
         payload = message.payload.decode()
         if message.topic == "evbox_elvi/maximum_current/state" and payload == "5":
-            current_received.set()
+            default_current_received.set()
+        if message.topic == "evbox_elvi/maximum_current/state" and payload == "8":
+            dynamic_current_received.set()
         if message.topic == "evbox_elvi/current_import/state" and payload == "10.000":
             measured_current_received.set()
         if message.topic == "evbox_elvi/power_active_import/state" and payload == "2.300":
@@ -104,8 +107,27 @@ async def run(bridge_host: str, mqtt_host: str) -> None:
                 {"startPeriod": 0, "limit": 5.0}
             ]
             await websocket.send(json.dumps([3, command[1], {"status": "Accepted"}]))
-            if not await asyncio.to_thread(current_received.wait, 5):
+            if not await asyncio.to_thread(default_current_received.wait, 5):
                 raise TimeoutError("Accepted 5 A state was not published through MQTT")
+
+            await websocket.send(
+                json.dumps(
+                    [
+                        2,
+                        "start-1",
+                        "StartTransaction",
+                        {
+                            "connectorId": 1,
+                            "idTag": "HomeAssistant",
+                            "meterStart": 0,
+                            "timestamp": "2026-09-30T12:00:00Z",
+                        },
+                    ]
+                )
+            )
+            start_response = json.loads(await asyncio.wait_for(websocket.recv(), timeout=10))
+            assert start_response[0:2] == [3, "start-1"]
+            transaction_id = start_response[2]["transactionId"]
 
             await websocket.send(
                 json.dumps(
@@ -115,6 +137,7 @@ async def run(bridge_host: str, mqtt_host: str) -> None:
                         "MeterValues",
                         {
                             "connectorId": 1,
+                            "transactionId": transaction_id,
                             "meterValue": [
                                 {
                                     "timestamp": "2026-09-30T12:00:00Z",
@@ -142,6 +165,34 @@ async def run(bridge_host: str, mqtt_host: str) -> None:
                 raise TimeoutError("2.300 kW meter value was not published through MQTT")
             if not await asyncio.to_thread(measured_current_received.wait, 5):
                 raise TimeoutError("10.000 A meter value was not published through MQTT")
+
+            publish_result = mqtt_client.publish(
+                "evbox_elvi/maximum_current/set",
+                "8",
+                qos=1,
+            )
+            publish_result.wait_for_publish(timeout=5)
+
+            active_command = await receive_command(websocket, "SetChargingProfile")
+            active_profile = active_command[3]["csChargingProfiles"]
+            assert active_profile["chargingProfilePurpose"] == "TxProfile"
+            assert active_profile["transactionId"] == transaction_id
+            assert active_profile["chargingSchedule"]["chargingSchedulePeriod"] == [
+                {"startPeriod": 0, "limit": 8.0}
+            ]
+            await websocket.send(
+                json.dumps([3, active_command[1], {"status": "Accepted"}])
+            )
+
+            default_command = await receive_command(websocket, "SetChargingProfile")
+            default_profile = default_command[3]["csChargingProfiles"]
+            assert default_profile["chargingProfilePurpose"] == "TxDefaultProfile"
+            assert "transactionId" not in default_profile
+            await websocket.send(
+                json.dumps([3, default_command[1], {"status": "Accepted"}])
+            )
+            if not await asyncio.to_thread(dynamic_current_received.wait, 5):
+                raise TimeoutError("Accepted dynamic 8 A state was not published through MQTT")
     finally:
         mqtt_client.disconnect()
         mqtt_client.loop_stop()
