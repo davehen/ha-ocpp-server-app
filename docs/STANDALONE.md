@@ -41,7 +41,7 @@ docker build \
   --pull \
   --build-arg BUILD_FROM=ghcr.io/home-assistant/aarch64-base-python:3.13-alpine3.21-2025.11.1 \
   --build-arg BUILD_ARCH=aarch64 \
-  --build-arg BUILD_VERSION=1.2.1 \
+  --build-arg BUILD_VERSION=1.3.0 \
   --tag evbox-elvi-ocpp:test \
   evbox_elvi_ocpp
 ```
@@ -191,8 +191,9 @@ docker exec evbox-test-mqtt \
 `-C 1` exits after the first value and `-W 2` stops waiting after two seconds
 if no retained value is available. The measured current and power are the
 latest samples received from the Elvi, not active OCPP queries. Their age is
-therefore limited by the configured `MeterValues` interval, normally 60
-seconds in this standalone setup.
+normally follows the configured `MeterValues` interval, 60 seconds in this
+standalone setup. A silent wallbox can leave an older reading: this is not an
+independent real-time electrical measurement.
 
 The maximum-current number is the commanded and accepted limit, not the
 instantaneous measurement. `current_import/state` comes from the latest
@@ -201,7 +202,23 @@ publishes the average of the active phases. Power comes from
 `Power.Active.Import`, or is derived from current and voltage when that
 measurand is absent.
 
-Version 1.2.1 doesn't yet publish separate sensors for cumulative energy or
+After reconnection, switches, measurements, and the maximum-current number reset
+to `None` (Home Assistant `unknown`), not guessed off/zero values. The bridge
+requests connector status and recovers an active transaction from MeterValues.
+It reapplies the saved limit using an active `TxProfile` or idle `TxDefaultProfile`
+and publishes the number only after acceptance on this connection. An active
+session is exposed as ON only after that synchronization and power evidence.
+Without an active transaction ID, no default-only command can confirm an active
+limit. MQTT reconnection republishes the latest states, then online/offline.
+Corrupted saved state blocks automatic restoration: select a valid current
+explicitly. A missing state file on a fresh installation uses the configured default.
+
+Remote start includes the saved limit in its TxProfile and reapplies it when
+StartTransaction assigns an ID. Acceptance is not a physical readback: validate
+the measured current on the Elvi before enabling automation. No automatic
+start/stop or solar policy is added.
+
+Version 1.3.0 doesn't yet publish separate sensors for cumulative energy or
 session energy. Do not treat `maximum_current/state` as an
 instantaneous-current measurement.
 
@@ -228,8 +245,10 @@ The current limit must be finite and between 0 and `MAXIMUM_CURRENT`. The Elvi
 may reject values unsupported by its firmware. A value of 5 A is allowed to
 preserve the suspension behavior used by the solar automation.
 
-When no transaction ID is known, the command sets the connector's
-`TxDefaultProfile`. During a transaction, it first sends a higher-stack
+When the connector is confirmed idle, the command sets its `TxDefaultProfile`.
+An active/unknown session without a transaction ID rejects the command instead
+of falsely acknowledging a default as an active limit. During a recovered
+transaction, it first sends a higher-stack
 `TxProfile` bound to that transaction ID so the limit applies to the active
 session. Only after that profile is accepted does it update the default for the
 next session.
@@ -273,9 +292,14 @@ first and changes only values that differ and aren't read-only.
 
 ### Start and stop charging
 
-With the vehicle connected:
+With the vehicle connected, set 8 A and wait for `maximum_current/state = 8`
+before starting. This Polestar may not start reliably at 6 A, although it can
+maintain charging at that limit:
 
 ```shell
+docker exec evbox-test-mqtt mosquitto_pub -h localhost \
+  -t evbox_elvi/maximum_current/set -m 8
+
 docker exec evbox-test-mqtt mosquitto_pub -h localhost \
   -t evbox_elvi/charge_control/set -m ON
 ```

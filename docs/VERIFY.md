@@ -37,7 +37,7 @@ cd /Users/davide.gallina/Development/personal/ha-ocpp-server-app
 Verification succeeds only after printing:
 
 ```text
-Container smoke test passed
+Container smoke passed: profiled start, 8/6/5/8 A, recovery, confirmed stop
 All container checks passed
 ```
 
@@ -65,23 +65,20 @@ the following end-to-end behavior:
 
 - WebSocket handshake with the `ocpp1.6` subprotocol;
 - `BootNotification` and an `Accepted` response;
-- the optional initial `TriggerMessage`;
-- publication of a 5 A limit over MQTT;
-- receipt of `SetChargingProfile` over OCPP;
-- use of `TxDefaultProfile` with a `5.0` limit;
-- publication of the accepted limit to
-  `evbox_elvi/maximum_current/state`;
-- submission of `MeterValues` with `Power.Active.Import = 2300 W` and
-  `Current.Import = 10 A`;
-- publication of `2.300` to
-  `evbox_elvi/power_active_import/state`;
-- publication of `10.000` to `evbox_elvi/current_import/state`;
-- creation of an OCPP transaction and assignment of its transaction ID;
-- an 8 A MQTT command during that active transaction;
-- receipt of a higher-stack `TxProfile` containing the matching transaction ID;
-- a following `TxDefaultProfile` update for the next transaction;
-- publication of the accepted dynamic limit to
-  `evbox_elvi/maximum_current/state`.
+- actual connector status in response to initial `TriggerMessage`, followed by
+  accepted idle-current synchronization;
+- an 8 A idle MQTT command and accepted TxDefaultProfile;
+- remote start carrying the accepted 8 A limit without a guessed transaction ID;
+- StartTransaction assignment and automatic transaction-bound current reapplication;
+- publication of measured 8 A / 5.520 kW from mock MeterValues;
+- dynamic 6 A, 5 A suspension, and 8 A resume profiles on the same transaction,
+  with active profile followed by the next-transaction default;
+- reconnection without BootNotification while suspended, reset to unknown, and
+  reapplication of the saved 5 A limit before publishing a confirmed ON session;
+- resumed measured charging after 8 A;
+- RemoteStop acceptance not optimistically turning OFF, followed by actual
+  StopTransaction, idle-current synchronization, and OFF/zero state;
+- historical MeterValues not resurrecting a stopped session.
 
 The unit tests additionally cover availability after reconnection without
 BootNotification, remote start and stop, transaction IDs,
@@ -90,6 +87,16 @@ transaction-profile construction, command-error logging, the current-and-voltage
 aggregate and per-phase measured current, invalid meter samples, OCPP response
 correlation, MeterValues configuration, and the exact required entity IDs and
 Discovery metadata.
+
+Regression tests also cover a single reset of all observations, preservation of
+the saved current limit, an active session without an ID refusing default-only
+confirmation, retired connections and queued commands, stale StopTransaction and
+MeterValues, duplicate responses and cached incoming CALLs, bounded send/response
+timeouts, pending start/stop races, MQTT snapshot restoration, retained command
+rejection, persistence validation and atomic round trips, and aggregate/phase power
+without double counting. Missing measurements are unknown rather than guessed zero.
+These checks do not prove the physical Elvi applies an accepted profile, certify
+electrical safety, or establish the cause of the intermittent disconnection.
 
 The mock doesn't communicate with the real Elvi, modify Home Assistant, or
 expose ports to the LAN.

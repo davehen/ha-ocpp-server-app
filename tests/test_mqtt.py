@@ -7,6 +7,25 @@ from app.mqtt import InvalidMqttCommand, MqttBridge, MqttCommandRejected
 
 
 class MqttDiscoveryTests(unittest.TestCase):
+    def test_missing_measurements_publish_unknown_not_zero(self) -> None:
+        bridge = MqttBridge.__new__(MqttBridge)
+        published = []
+        bridge.publish = lambda topic, payload: published.append(payload)
+        bridge.publish_power(None)
+        bridge.publish_current(None)
+        bridge.publish_power(0)
+        bridge.publish_current(8)
+        self.assertEqual(published, ["None", "None", "0.000", "8.000"])
+
+    def test_switch_unknown_and_known_payloads(self) -> None:
+        bridge = MqttBridge.__new__(MqttBridge)
+        published = []
+        bridge.publish = lambda topic, payload: published.append((topic, payload))
+        for method in (bridge.publish_charge_control, bridge.publish_charger_availability):
+            for value in (None, True, False):
+                method(value)
+        self.assertEqual([payload for _, payload in published], ["None", "ON", "OFF"] * 2)
+
     def test_preserves_required_home_assistant_entity_ids(self) -> None:
         self.assertEqual(
             MqttBridge.DEFAULT_ENTITY_IDS,

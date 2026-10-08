@@ -62,12 +62,14 @@ async def run() -> None:
         connection = OcppConnection(
             charge_point_id,
             websocket,
-            controller.handle_ocpp_call,
-            controller.after_ocpp_call,
+            lambda action, payload: controller.handle_ocpp_call(
+                action, payload, connection=connection
+            ),
+            lambda action: controller.after_ocpp_call(action, connection=connection),
             config.command_timeout,
         )
-        await controller.attach(connection)
         try:
+            await controller.attach(connection)
             await connection.run()
         finally:
             controller.detach(connection)

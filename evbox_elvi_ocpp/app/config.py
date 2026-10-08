@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import math
 import os
 from dataclasses import dataclass
 from pathlib import Path
@@ -66,5 +67,16 @@ class Config:
             raise ValueError("OCPP id_tag must contain between 1 and 20 characters")
         if self.number_of_phases not in {1, 3}:
             raise ValueError("number_of_phases must be 1 or 3")
-        if self.maximum_current < 6:
-            raise ValueError("maximum_current must be at least 6 A")
+        if not math.isfinite(self.maximum_current) or not 6 <= self.maximum_current <= 32:
+            raise ValueError("maximum_current must be finite and between 6 and 32 A")
+        for name, value, minimum, maximum in (
+            ("mqtt_port", self.mqtt_port, 1, 65535),
+            ("ocpp_port", self.ocpp_port, 1, 65535),
+            ("heartbeat_interval", self.heartbeat_interval, 30, 3600),
+            ("meter_value_interval", self.meter_value_interval, 10, 3600),
+            ("command_timeout", self.command_timeout, 5, 60),
+        ):
+            if not minimum <= value <= maximum:
+                raise ValueError(f"{name} must be between {minimum} and {maximum}")
+        if self.log_level not in {"DEBUG", "INFO", "WARNING", "ERROR"}:
+            raise ValueError("Invalid log_level")

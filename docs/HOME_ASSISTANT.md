@@ -35,10 +35,10 @@ MQTT Discovery requests these exact entity IDs:
 | `sensor.charger_current_import` | Instantaneous measured charging current in A |
 | `sensor.charger_power_active_import` | Instantaneous charging power in kW |
 
-The existing dashboard and charging automations continue to use the preserved
-control, limit, and power IDs. The exported Home Assistant registry confirms
-that `sensor.charger_current_import` was also provided by the old OCPP
-integration, although the active YAML does not currently reference it.
+The existing dashboard and charging automations use these preserved IDs.
+The October 8 registry export already shows the five MQTT entities; an exported
+snapshot is not a check of the live installation. The active YAML does not
+currently reference the measured-current sensor.
 
 The number holds the commanded limit, while `sensor.charger_current_import`
 comes from the latest OCPP `Current.Import` sample. An unphased sample is used
@@ -116,15 +116,30 @@ the visible entity IDs and don't require changes.
 
 ### Adapt charging power trigger
 
-Replace the device-based trigger with:
+Use a state trigger that also accepts `unknown`/`unavailable` → `on`, plus a
+Home Assistant startup trigger guarded by the actual session state. Replace the
+trigger list and add this condition; keep the existing actions and `mode: single`:
 
 ```yaml
-- alias: When charging starts
-  trigger: state
-  entity_id: switch.charger_charge_control
-  from: "off"
-  to: "on"
+triggers:
+  - alias: When a charging session becomes ready
+    trigger: state
+    entity_id: switch.charger_charge_control
+    to: "on"
+  - alias: Resume after Home Assistant startup
+    trigger: homeassistant
+    event: start
+conditions:
+  - condition: state
+    entity_id: switch.charger_charge_control
+    state: "on"
 ```
+
+Do not add `from: "off"`: that would miss a recovered session. The
+`switch.turned_on` target trigger is not the recovery-aware replacement. This is
+also needed when the device-trigger migration has already been completed in the
+UI. The server cannot restart a stopped HA automation without a suitable trigger;
+it deliberately does not fabricate an OFF/ON cycle.
 
 ### Auto-start charging conditions
 
@@ -195,19 +210,22 @@ owns the required ID. Do not continue until that conflict has been resolved.
 
 ## Functional validation
 
-When updating an existing installation to 1.2.1, update and restart the add-on,
+When updating an existing installation to 1.3.0, update and restart the add-on,
 then wait for the Elvi to reconnect. Verify that `evbox_elvi/availability` is
-`online` and the five charger entities are available. No entity recreation or
-MQTT broker changes are required.
+`online`. Switches and the limit may initially be `unknown`: wait for connector
+recovery and the logged accepted current profile. No entity recreation or MQTT
+broker changes are required. Apply the recovery-aware automation trigger above.
 
 Run this test under direct supervision.
 
 1. Without a vehicle, verify availability `on`, charge control `off`, and power
    `0 kW`.
 2. Connect the vehicle and verify availability `off` and charge control `off`.
-3. Manually turn on `switch.charger_charge_control`.
+3. Set 8 A before starting, then manually turn on `switch.charger_charge_control`.
 4. Check the log for `RemoteStartTransaction`, `StartTransaction`, and a
    charging `StatusNotification`.
+   Confirm measured current settles near 8 A, not the previous 12 A limit.
+   Acceptance of the profile alone does not prove the physical limit was applied.
 5. During the active transaction, set 6 A, 8 A, and 12 A. For each value,
    confirm:
    - an accepted `TxProfile` containing the active transaction ID;
@@ -217,8 +235,18 @@ Run this test under direct supervision.
 6. Set 5 A and confirm the suspension behavior used by the solar automation and
    measured current and power falling to zero.
 7. Restore 12 A.
-8. Stop the session and verify `RemoteStopTransaction`, charge control `off`,
-   and power at zero.
+8. Stop the session and verify `RemoteStopTransaction`, then the actual
+   `StopTransaction`, charge control `off`, and power at zero. Acceptance alone
+   must not immediately flip the session switch.
+9. During a supervised 8 A session, restart the add-on. Confirm reconnection,
+   charge control returning to `on`, and measured current remaining near 8 A.
+   Repeat with a suspended session: zero current must not imply a closed session.
+10. With an idle car and saved 8 A, restart the add-on, wait for synchronization,
+    and start a fresh session. Check the initial active profile and measured
+    current: it must not silently use the previous 12 A default.
+11. After manual validation, enable automation and repeat a supervised restart
+    during charging. Confirm `Adapt charging power` is running again after the
+    recovered switch becomes `on`.
 
 Apply the replacement YAML blocks only after this test passes.
 
@@ -236,6 +264,29 @@ setpoint with the add-on log, the number state, and the Elvi's physical current.
 ## Failure behavior
 
 - When the wallbox disconnects, MQTT entities become unavailable.
+- After connection, switches and the number are unknown until connector/session
+  evidence and current synchronization are available. Transaction-bound MeterValues
+  recover an active or suspended session; ON additionally requires accepted current
+  synchronization and power evidence. Connector status is requested after the
+  first OCPP call, without requiring BootNotification.
+- A single connection reset invalidates both switches, the transaction ID, and
+  measured current/power before publishing online. Missing measurements use the
+  MQTT `None` payload (Home Assistant `unknown`), not a guessed zero. Explicit
+  non-charging connector status or StopTransaction may still publish zero.
+- Connector availability is reconciled with session evidence: StartTransaction
+  establishes an occupied connector; StopTransaction does not prove the cable
+  was unplugged. Until new connector status arrives, availability is unknown.
+- The saved setpoint is not a readback. On recovery the bridge reapplies it as an
+  active TxProfile or idle TxDefaultProfile before publishing the confirmed number.
+  An active session without a transaction ID cannot acknowledge a default-only
+  update as its active limit. A failed recovery remains unknown and can retry when
+  the next OCPP message arrives. There is no automatic start/stop or solar policy.
+- Remote start includes the last accepted current as a TxProfile. Rejection does
+  not trigger a second start without a limit. Confirm the measured current on
+  real hardware; an accepted OCPP response is not a measurement.
+- These changes remove reproduced server-side weaknesses but do not establish
+  the cause of the historical disconnection. Keep automations disabled during
+  initial hardware validation and retain DEBUG logs if it recurs.
 - Measured current is published only when the Elvi sends `Current.Import`; its
   normal update cadence is therefore `meter_value_interval`.
 - During charging, a new current limit is published only after the Elvi accepts
@@ -246,10 +297,29 @@ setpoint with the add-on log, the number state, and the Elvi's physical current.
   transaction; failure of this follow-up is logged without undoing the active
   limit.
 - A stop is rejected when no transaction ID is known.
+- RemoteStart/Stop acceptance is not session completion. Pending suppression
+  expires after `command_timeout` so an explicit retry is possible; no retry
+  automatically starts or stops the vehicle.
+- Calls are serialized and send/response waits are bounded. Duplicate/late
+  responses and retired connections cannot overwrite the current session.
+- Closed/other-transaction telemetry and older timestamped observations are ignored.
+- After broker reconnection or HA birth, Discovery and latest states are republished
+  before online/offline. Retained control commands are ignored.
 - An unsupported OCPP action receives a `CALLERROR`.
 - Malformed JSON is ignored without stopping the server.
-- The last accepted current and transaction counter are saved under `/data` and
+- The last accepted current, transaction counter, and closed-transaction marker are saved under `/data` and
   included in add-on backups.
+- Invalid/corrupted saved state is logged and blocks automatic current restoration;
+  set a valid current explicitly to resume synchronization. A missing file on a
+  fresh installation uses the configured initial default. No corrupted setpoint
+  silently becomes an automatic increase to the configured ceiling.
+
+An OCPP Accepted response is not proof of the physical current limit. Local/RFID
+starts can begin before the server receives the transaction ID and reapplies its
+profile. MQTT/HA/network loss does not automatically stop charging: the Elvi may
+keep its last applied limit. The configured ceiling is software validation, not
+an electrical protection. Hardware installation limits and protections must remain
+effective independently of this add-on. Tests do not certify electrical safety.
 
 ## Rollback
 

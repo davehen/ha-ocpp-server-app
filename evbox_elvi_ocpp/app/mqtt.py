@@ -51,6 +51,7 @@ class MqttBridge:
         self._model = "Elvi"
         self._serial_number: str | None = None
         self._firmware_version: str | None = None
+        self._retained_payloads: dict[str, str] = {}
         self._client = mqtt.Client(
             callback_api_version=mqtt.CallbackAPIVersion.VERSION2,
             client_id="evbox-elvi-ocpp-bridge",
@@ -79,7 +80,9 @@ class MqttBridge:
             self._config.mqtt_host,
             self._config.mqtt_port,
         )
-        self._client.connect(self._config.mqtt_host, self._config.mqtt_port, keepalive=60)
+        await asyncio.to_thread(
+            self._client.connect, self._config.mqtt_host, self._config.mqtt_port, keepalive=60
+        )
         self._client.loop_start()
         await asyncio.wait_for(self._connected.wait(), timeout=30)
 
@@ -110,7 +113,7 @@ class MqttBridge:
             "device": device,
             "origin": {
                 "name": "EVBox Elvi OCPP bridge",
-                "sw_version": "1.2.1",
+                "sw_version": "1.3.0",
                 "support_url": "https://github.com/davehen/ha-ocpp-server-app",
             },
             "qos": 1,
@@ -158,6 +161,7 @@ class MqttBridge:
                     "min": 0,
                     "max": self._config.maximum_current,
                     "step": 0.1,
+                    "payload_reset": "None",
                     "mode": "slider",
                 },
             ),
@@ -220,31 +224,45 @@ class MqttBridge:
         """Publish a value below the app topic prefix."""
         self._publish_raw(self.topic(suffix), str(value), retain=retain)
 
-    def publish_charge_control(self, enabled: bool) -> None:
+    def publish_charge_control(self, enabled: bool | None) -> None:
         """Publish the acknowledged charge-control state."""
-        self.publish(f"{self.CHARGE_CONTROL}/state", "ON" if enabled else "OFF")
+        self.publish(
+            f"{self.CHARGE_CONTROL}/state",
+            "None" if enabled is None else "ON" if enabled else "OFF",
+        )
 
-    def publish_charger_availability(self, enabled: bool) -> None:
+    def publish_charger_availability(self, enabled: bool | None) -> None:
         """Publish whether the connector is physically available."""
-        self.publish(f"{self.CHARGER_AVAILABILITY}/state", "ON" if enabled else "OFF")
+        self.publish(
+            f"{self.CHARGER_AVAILABILITY}/state",
+            "None" if enabled is None else "ON" if enabled else "OFF",
+        )
 
-    def publish_maximum_current(self, amperes: float) -> None:
+    def publish_maximum_current(self, amperes: float | None) -> None:
         """Publish the charger-acknowledged current limit."""
-        self.publish(f"{self.MAXIMUM_CURRENT}/state", f"{amperes:g}")
+        self.publish(f"{self.MAXIMUM_CURRENT}/state", "None" if amperes is None else f"{amperes:g}")
 
-    def publish_power(self, kilowatts: float) -> None:
+    def publish_power(self, kilowatts: float | None) -> None:
         """Publish active imported power in kilowatts."""
-        self.publish(f"{self.POWER_ACTIVE_IMPORT}/state", f"{max(0.0, kilowatts):.3f}")
+        self.publish(
+            f"{self.POWER_ACTIVE_IMPORT}/state",
+            "None" if kilowatts is None else f"{max(0.0, kilowatts):.3f}",
+        )
 
-    def publish_current(self, amperes: float) -> None:
+    def publish_current(self, amperes: float | None) -> None:
         """Publish measured imported current in amperes."""
-        self.publish(f"{self.CURRENT_IMPORT}/state", f"{max(0.0, amperes):.3f}")
+        self.publish(
+            f"{self.CURRENT_IMPORT}/state",
+            "None" if amperes is None else f"{max(0.0, amperes):.3f}",
+        )
 
     def publish_charger_online(self, online: bool) -> None:
         """Publish entity availability based on the OCPP connection."""
         self.publish(self.AVAILABILITY, "online" if online else "offline")
 
     def _publish_raw(self, topic: str, payload: str, *, retain: bool) -> None:
+        if retain:
+            self._retained_payloads[topic] = payload
         result = self._client.publish(topic, payload, qos=1, retain=retain)
         if result.rc != self._mqtt_api.MQTT_ERR_SUCCESS:
             LOGGER.error("MQTT publish failed for %s with rc=%s", topic, result.rc)
@@ -269,9 +287,23 @@ class MqttBridge:
                 ("homeassistant/status", 0),
             ]
         )
-        self.publish_discovery()
         if self._loop is not None:
-            self._loop.call_soon_threadsafe(self._connected.set)
+            self._loop.call_soon_threadsafe(self._restore_after_connect)
+
+    def _restore_after_connect(self) -> None:
+        """Republish the coherent retained snapshot on the asyncio owner thread."""
+        self.publish_discovery()
+        availability_topic = self.topic(self.AVAILABILITY)
+        for topic, payload in list(self._retained_payloads.items()):
+            if topic != availability_topic and topic.startswith(
+                self._config.mqtt_topic_prefix + "/"
+            ):
+                self._publish_raw(topic, payload, retain=True)
+        if availability_topic in self._retained_payloads:
+            self._publish_raw(
+                availability_topic, self._retained_payloads[availability_topic], retain=True
+            )
+        self._connected.set()
 
     def _on_disconnect(
         self,
@@ -283,12 +315,18 @@ class MqttBridge:
     ) -> None:
         if reason_code.is_failure:
             LOGGER.warning("Disconnected unexpectedly from MQTT broker: %s", reason_code)
+        if self._loop is not None:
+            self._loop.call_soon_threadsafe(self._connected.clear)
 
     def _on_message(self, client: Any, userdata: Any, message: Any) -> None:
         payload = message.payload.decode("utf-8", errors="replace").strip()
         if message.topic == "homeassistant/status":
             if payload.lower() == "online":
-                self.publish_discovery()
+                if self._loop is not None:
+                    self._loop.call_soon_threadsafe(self._restore_after_connect)
+            return
+        if message.retain:
+            LOGGER.warning("Ignoring retained MQTT command: %s", message.topic)
             return
         if self._command_handler is None or self._loop is None:
             LOGGER.error("Ignoring MQTT command before command handler is ready")

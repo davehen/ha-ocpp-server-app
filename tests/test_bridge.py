@@ -29,16 +29,16 @@ class FakeMqtt:
     def publish_charger_online(self, online: bool) -> None:
         self.values["online"] = online
 
-    def publish_charge_control(self, enabled: bool) -> None:
+    def publish_charge_control(self, enabled: bool | None) -> None:
         self.values["charge_control"] = enabled
 
-    def publish_charger_availability(self, enabled: bool) -> None:
+    def publish_charger_availability(self, enabled: bool | None) -> None:
         self.values["availability"] = enabled
 
-    def publish_power(self, kilowatts: float) -> None:
+    def publish_power(self, kilowatts: float | None) -> None:
         self.values["power"] = kilowatts
 
-    def publish_current(self, amperes: float) -> None:
+    def publish_current(self, amperes: float | None) -> None:
         self.values["current"] = amperes
 
     def publish_maximum_current(self, amperes: float) -> None:
@@ -78,6 +78,52 @@ class FakeStateStore:
 
 
 class BridgeControllerTests(unittest.IsolatedAsyncioTestCase):
+    async def test_reconnect_invalidates_all_observations_not_saved_limit(self) -> None:
+        self.bridge.start()
+        await self.bridge.attach(self.connection)
+        await self.bridge.handle_ocpp_call(
+            "StatusNotification", {"connectorId": 1, "status": "Available"}
+        )
+        await self.bridge.handle_mqtt_command("evbox_elvi/maximum_current/set", "8")
+        self.bridge.detach(self.connection)
+        await self.bridge.attach(FakeConnection())
+        for key in ("charge_control", "availability", "power", "current"):
+            self.assertIsNone(self.mqtt.values[key], key)
+        self.assertIsNone(self.mqtt.values["maximum_current"])
+        self.assertEqual(self.bridge._store.state.maximum_current, 8)  # noqa: SLF001
+        await self.bridge.handle_ocpp_call("Heartbeat", {})
+        self.assertIsNone(self.mqtt.values["availability"])
+        await self.bridge.handle_ocpp_call(
+            "StatusNotification", {"connectorId": 1, "status": "Available"}
+        )
+        await self.bridge.handle_mqtt_command("evbox_elvi/maximum_current/set", "8")
+        self.assertTrue(self.mqtt.values["availability"])
+        self.assertFalse(self.mqtt.values["charge_control"])
+        self.assertEqual(self.mqtt.values["power"], 0)
+
+    async def test_start_and_stop_reconcile_connector_without_guessing_unplugged(self) -> None:
+        await self.bridge.attach(self.connection)
+        response = await self.bridge.handle_ocpp_call("StartTransaction", {})
+        await self.bridge.handle_ocpp_call(
+            "StatusNotification", {"connectorId": 1, "status": "SuspendedEVSE"}
+        )
+        await self.bridge.handle_mqtt_command("evbox_elvi/maximum_current/set", "8")
+        self.assertFalse(self.mqtt.values["availability"])
+        self.assertTrue(self.mqtt.values["charge_control"])
+        await self.bridge.handle_ocpp_call(
+            "StopTransaction", {"transactionId": response["transactionId"]}
+        )
+        await self.bridge.handle_mqtt_command("evbox_elvi/maximum_current/set", "8")
+        self.assertIsNone(self.mqtt.values["availability"])
+        self.assertFalse(self.mqtt.values["charge_control"])
+
+    async def test_unknown_status_does_not_create_connector_state(self) -> None:
+        await self.bridge.attach(self.connection)
+        await self.bridge.handle_ocpp_call(
+            "StatusNotification", {"connectorId": 1, "status": "invalid"}
+        )
+        self.assertIsNone(self.mqtt.values["availability"])
+
     def setUp(self) -> None:
         self.config = Config(
             mqtt_host="mqtt",
@@ -99,6 +145,15 @@ class BridgeControllerTests(unittest.IsolatedAsyncioTestCase):
         store = FakeStateStore(self.config.maximum_current)
         self.bridge = BridgeController(self.config, self.mqtt, store)  # type: ignore[arg-type]
         self.connection = FakeConnection()
+
+    async def prepare_idle(self, current: float | None = None) -> None:
+        await self.bridge.attach(self.connection)
+        await self.bridge.handle_ocpp_call(
+            "StatusNotification", {"connectorId": 1, "status": "Preparing"}
+        )
+        if current is not None:
+            await self.bridge.handle_mqtt_command("evbox_elvi/maximum_current/set", str(current))
+            self.connection.calls.clear()
 
     async def test_reconnect_without_boot_notification_restores_availability(self) -> None:
         self.bridge.start()
@@ -142,20 +197,22 @@ class BridgeControllerTests(unittest.IsolatedAsyncioTestCase):
             {"connectorId": 1, "status": "Preparing", "errorCode": "NoError"},
         )
         self.assertFalse(self.mqtt.values["availability"])
-        self.assertFalse(self.mqtt.values["charge_control"])
+        self.assertIsNone(self.mqtt.values["charge_control"])
 
         await self.bridge.handle_ocpp_call(
             "StatusNotification",
             {"connectorId": 1, "status": "Charging", "errorCode": "NoError"},
         )
-        self.assertTrue(self.mqtt.values["charge_control"])
+        self.assertIsNone(self.mqtt.values["charge_control"])
 
         self.mqtt.values["power"] = 2.5
         self.mqtt.values["current"] = 8.0
+        await self.bridge.handle_ocpp_call("MeterValues", {"connectorId": 1, "transactionId": 123})
         await self.bridge.handle_ocpp_call(
             "StatusNotification",
             {"connectorId": 1, "status": "SuspendedEVSE", "errorCode": "NoError"},
         )
+        await self.bridge.handle_mqtt_command("evbox_elvi/maximum_current/set", "8")
         self.assertTrue(self.mqtt.values["charge_control"])
         self.assertEqual(self.mqtt.values["power"], 0)
         self.assertEqual(self.mqtt.values["current"], 0)
@@ -184,7 +241,7 @@ class BridgeControllerTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(self.mqtt.values["power"], 2.3)
 
     async def test_idle_current_command_uses_tx_default_profile(self) -> None:
-        await self.bridge.attach(self.connection)  # type: ignore[arg-type]
+        await self.prepare_idle()
 
         await self.bridge.handle_mqtt_command("evbox_elvi/maximum_current/set", "8.5")
 
@@ -241,7 +298,7 @@ class BridgeControllerTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(self.mqtt.values["maximum_current"], 8.0)
 
     async def test_five_amp_pause_value_is_forwarded_unchanged(self) -> None:
-        await self.bridge.attach(self.connection)  # type: ignore[arg-type]
+        await self.prepare_idle()
 
         await self.bridge.handle_mqtt_command("evbox_elvi/maximum_current/set", "5")
 
@@ -289,7 +346,7 @@ class BridgeControllerTests(unittest.IsolatedAsyncioTestCase):
         )
 
     async def test_rejected_current_does_not_publish_or_persist(self) -> None:
-        await self.bridge.attach(self.connection)  # type: ignore[arg-type]
+        await self.prepare_idle()
         self.connection.responses["SetChargingProfile"] = {"status": "Rejected"}
 
         with self.assertRaisesRegex(
@@ -298,7 +355,7 @@ class BridgeControllerTests(unittest.IsolatedAsyncioTestCase):
         ):
             await self.bridge.handle_mqtt_command("evbox_elvi/maximum_current/set", "7")
 
-        self.assertNotIn("maximum_current", self.mqtt.values)
+        self.assertIsNone(self.mqtt.values["maximum_current"])
 
     async def test_rejected_active_transaction_profile_is_not_reported_as_applied(self) -> None:
         await self.bridge.attach(self.connection)  # type: ignore[arg-type]
@@ -320,7 +377,7 @@ class BridgeControllerTests(unittest.IsolatedAsyncioTestCase):
             await self.bridge.handle_mqtt_command("evbox_elvi/maximum_current/set", "7")
 
         self.assertEqual(len(self.connection.calls), 1)
-        self.assertNotIn("maximum_current", self.mqtt.values)
+        self.assertIsNone(self.mqtt.values["maximum_current"])
 
     async def test_rejected_default_follow_up_does_not_undo_active_limit(self) -> None:
         await self.bridge.attach(self.connection)  # type: ignore[arg-type]
@@ -344,13 +401,15 @@ class BridgeControllerTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(self.mqtt.values["maximum_current"], 7.0)
 
     async def test_remote_start_and_stop_use_wallbox_transaction(self) -> None:
-        await self.bridge.attach(self.connection)  # type: ignore[arg-type]
+        await self.prepare_idle(8)
 
         await self.bridge.handle_mqtt_command("evbox_elvi/charge_control/set", "ON")
-        self.assertEqual(
-            self.connection.calls[-1],
-            ("RemoteStartTransaction", {"idTag": "HomeAssistant", "connectorId": 1}),
-        )
+        action, payload = self.connection.calls[-1]
+        self.assertEqual(action, "RemoteStartTransaction")
+        self.assertEqual(payload["idTag"], "HomeAssistant")
+        self.assertEqual(payload["connectorId"], 1)
+        self.assertEqual(payload["chargingProfile"]["chargingProfilePurpose"], "TxProfile")
+        self.assertNotIn("transactionId", payload["chargingProfile"])
         start_response = await self.bridge.handle_ocpp_call(
             "StartTransaction",
             {
@@ -366,9 +425,10 @@ class BridgeControllerTests(unittest.IsolatedAsyncioTestCase):
             self.connection.calls[-1],
             ("RemoteStopTransaction", {"transactionId": start_response["transactionId"]}),
         )
-        self.assertFalse(self.mqtt.values["charge_control"])
+        self.assertIsNone(self.mqtt.values["charge_control"])
 
     async def test_invalid_charge_control_payload_is_an_expected_command_error(self) -> None:
+        await self.bridge.attach(self.connection)
         with self.assertRaisesRegex(InvalidMqttCommand, "Invalid charge-control payload"):
             await self.bridge.handle_mqtt_command(
                 "evbox_elvi/charge_control/set",
@@ -376,13 +436,104 @@ class BridgeControllerTests(unittest.IsolatedAsyncioTestCase):
             )
 
     async def test_rejected_remote_start_is_an_expected_command_error(self) -> None:
-        await self.bridge.attach(self.connection)  # type: ignore[arg-type]
+        await self.prepare_idle(8)
         self.connection.responses["RemoteStartTransaction"] = {"status": "Rejected"}
 
         with self.assertRaisesRegex(MqttCommandRejected, "rejected RemoteStartTransaction"):
             await self.bridge.handle_mqtt_command("evbox_elvi/charge_control/set", "ON")
 
-        self.assertNotIn("charge_control", self.mqtt.values)
+        self.assertFalse(self.mqtt.values["charge_control"])
+
+    async def test_start_uses_persisted_limit_after_server_restart(self) -> None:
+        self.bridge._store.state.maximum_current = 8  # noqa: SLF001
+        self.bridge.start()
+        await self.prepare_idle(8)
+        await self.bridge.handle_mqtt_command("evbox_elvi/charge_control/set", "ON")
+
+        profile = self.connection.calls[-1][1]["chargingProfile"]
+        self.assertEqual(profile["stackLevel"], 1)
+        self.assertEqual(profile["chargingProfileKind"], "Relative")
+        self.assertEqual(profile["chargingSchedule"]["chargingRateUnit"], "A")
+        self.assertEqual(
+            profile["chargingSchedule"]["chargingSchedulePeriod"],
+            [{"startPeriod": 0, "limit": 8}],
+        )
+
+    async def test_start_does_not_fall_back_when_charging_profile_is_rejected(self) -> None:
+        await self.prepare_idle(8)
+        self.connection.responses["RemoteStartTransaction"] = {"status": "Rejected"}
+        with self.assertRaises(MqttCommandRejected):
+            await self.bridge.handle_mqtt_command("evbox_elvi/charge_control/set", "ON")
+        self.assertEqual(len(self.connection.calls), 1)
+        self.assertFalse(self.mqtt.values["charge_control"])
+
+    async def test_reconnected_transaction_restores_on_even_when_suspended(self) -> None:
+        self.bridge.start()
+        await self.bridge.attach(self.connection)  # type: ignore[arg-type]
+        self.assertIsNone(self.mqtt.values["charge_control"])
+        self.assertIsNone(self.mqtt.values["availability"])
+        await self.bridge.handle_ocpp_call(
+            "MeterValues",
+            {
+                "connectorId": 1,
+                "transactionId": 123,
+                "meterValue": [
+                    {
+                        "sampledValue": [
+                            {"measurand": "Current.Import", "value": "0", "unit": "A"},
+                        ]
+                    }
+                ],
+            },
+        )
+        self.assertIsNone(self.mqtt.values["charge_control"])
+        self.assertFalse(self.mqtt.values["availability"])
+        await self.bridge.handle_mqtt_command("evbox_elvi/maximum_current/set", "8")
+        self.assertEqual(self.connection.calls[0][1]["csChargingProfiles"]["transactionId"], 123)
+        await self.bridge.handle_mqtt_command("evbox_elvi/charge_control/set", "OFF")
+        self.assertEqual(
+            self.connection.calls[-1], ("RemoteStopTransaction", {"transactionId": 123})
+        )
+
+    async def test_meter_without_valid_transaction_does_not_invent_session(self) -> None:
+        await self.bridge.attach(self.connection)  # type: ignore[arg-type]
+        for payload in (
+            {"connectorId": 1},
+            {"connectorId": 1, "transactionId": "invalid"},
+            {"connectorId": 1, "transactionId": -1},
+            {"connectorId": 0, "transactionId": 123},
+        ):
+            await self.bridge.handle_ocpp_call("MeterValues", payload)
+            self.assertIsNone(self.mqtt.values["charge_control"])
+
+    async def test_reconnect_requests_status_after_first_response_without_boot(self) -> None:
+        await self.bridge.attach(self.connection)  # type: ignore[arg-type]
+        await self.bridge.after_ocpp_call("MeterValues")
+        await self.bridge._initialization_task  # noqa: SLF001
+        self.assertEqual(
+            self.connection.calls,
+            [
+                ("TriggerMessage", {"requestedMessage": "StatusNotification", "connectorId": 1}),
+            ],
+        )
+        await self.bridge.after_ocpp_call("Heartbeat")
+        self.assertEqual(len(self.connection.calls), 1)
+
+    async def test_boot_does_not_reset_recovered_active_session(self) -> None:
+        await self.bridge.attach(self.connection)  # type: ignore[arg-type]
+        await self.bridge.handle_ocpp_call("MeterValues", {"connectorId": 1, "transactionId": 123})
+        await self.bridge.handle_ocpp_call("BootNotification", {})
+        self.assertIsNone(self.mqtt.values["charge_control"])
+
+    async def test_central_status_does_not_override_connector_session(self) -> None:
+        await self.bridge.attach(self.connection)  # type: ignore[arg-type]
+        await self.bridge.handle_ocpp_call(
+            "StatusNotification", {"connectorId": 1, "status": "Charging"}
+        )
+        await self.bridge.handle_ocpp_call(
+            "StatusNotification", {"connectorId": 0, "status": "Available"}
+        )
+        self.assertIsNone(self.mqtt.values["charge_control"])
 
 
 class PowerExtractionTests(unittest.TestCase):

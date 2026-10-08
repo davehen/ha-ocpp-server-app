@@ -101,15 +101,27 @@ uses preserved entity IDs rather than an internal OCPP device reference.
 
 ### Replacement blocks
 
-Replace the device trigger in `Adapt charging power` with:
+Replace the triggers in `Adapt charging power` and add the state condition below;
+preserve its existing actions and `mode: single`. This also replaces a previously
+migrated `switch.turned_on` trigger so recovered sessions can resume automation:
 
 ```yaml
-- alias: When charging starts
-  trigger: state
-  entity_id: switch.charger_charge_control
-  from: "off"
-  to: "on"
+triggers:
+  - alias: When a charging session becomes ready
+    trigger: state
+    entity_id: switch.charger_charge_control
+    to: "on"
+  - alias: Resume after Home Assistant startup
+    trigger: homeassistant
+    event: start
+conditions:
+  - condition: state
+    entity_id: switch.charger_charge_control
+    state: "on"
 ```
+
+No `from: "off"`: recovery from unknown/unavailable must also trigger it. The
+bridge does not fabricate OFF/ON cycles to restart HA automations.
 
 Replace the two charger device conditions in `Auto-start charging` with:
 
@@ -161,9 +173,10 @@ charging and preserve a Home Assistant backup.
    `0 kW`.
 10. Connect a vehicle. Verify that availability changes to `off` while charge
     control remains `off`.
-11. Manually start charging from the charge-control switch. Confirm the app log
+11. Set 8 A, then manually start charging from the charge-control switch. Confirm the app log
     shows an accepted `RemoteStartTransaction`, then a `StartTransaction` and
     charging `StatusNotification` from the Elvi.
+    Verify physical current starts near 8 A, not the previous 12 A default.
 12. During the active transaction, set 6 A, 8 A, and 12 A one at a time. For
     every value, confirm an accepted transaction-bound `TxProfile`, the number
     state update, and a matching physical change in
@@ -177,11 +190,28 @@ charging and preserve a Home Assistant backup.
     finally `Auto-start charging`, in that order.
 16. Supervise at least one complete solar-controlled session. Check every
     calculated setpoint against the Elvi log and the physical charging current.
+17. Restart during a supervised active/suspended session, then during idle with
+    a saved 8 A limit. Confirm synchronization, correct measured current after a
+    fresh start, and recovery of `Adapt charging power` when enabled.
 
 ## Failure behavior
 
 - When the wallbox disconnects, MQTT availability becomes `offline`; commands
   are rejected and retained entity states are not presented as live.
+- Reconnection resets both switches, the number, and measurements to unknown.
+  Connector status and transaction-bound MeterValues recover observations; the
+  saved limit is reapplied before publishing the confirmed number/session state.
+  An active session requires its transaction ID, an accepted TxProfile, and power
+  evidence. Suspended sessions remain active even at zero measured current.
+- Remote start includes the saved current profile and reapplies it once the
+  transaction ID is assigned. RemoteStart/Stop acceptance is not completion: the
+  switches follow actual session evidence. Pending suppression expires after
+  `command_timeout` to permit explicit retries, without automatic start/stop.
+- MQTT reconnection and HA birth republish Discovery and latest states before
+  availability. Retained commands are ignored.
+- Complete OCPP calls are serialized, send/response waits are bounded, and
+  duplicate/late responses cannot terminate the receive loop. Retired sessions
+  and historical closed-transaction telemetry cannot override live state.
 - Measured current updates only when the Elvi sends `Current.Import`, normally
   at the configured `meter_value_interval`.
 - While charging, a current value is published only after the Elvi accepts the
@@ -194,8 +224,17 @@ charging and preserve a Home Assistant backup.
   app logs the failure and leaves the switch state unchanged.
 - Invalid or unsupported charge-point calls receive an OCPP error response;
   malformed JSON is ignored without terminating the server.
-- The last current value accepted by the wallbox and the transaction counter are
+- The last current value accepted by the wallbox, transaction counter, and closed-session marker are
   stored under the app's `/data` volume and included in app backups.
+- Corrupted saved state blocks automatic current restoration until a valid current
+  is set explicitly. A missing file on a fresh installation uses the configured
+  default. BootNotification also invalidates observations if the socket stays open.
+
+These tests do not establish the cause of the historical intermittent disconnect
+or certify electrical safety. Acceptance is not physical current measurement;
+local/RFID starts can precede server synchronization. Network/HA/MQTT loss does
+not automatically stop charging. Hardware limits and protections must remain
+effective independently of this software. See the [full installation guide](../docs/HOME_ASSISTANT.md).
 
 ## Rollback
 

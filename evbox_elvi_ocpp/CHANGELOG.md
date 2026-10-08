@@ -1,5 +1,31 @@
 # Changelog
 
+## 1.3.0
+
+- Centralize connection-state reset and connector switch reconciliation. Clear
+  stale measurements to unknown, preserving the saved requested current limit.
+- Keep switches unknown until charger status or transaction data is received.
+- Recover charge control and the active transaction from transaction-bound
+  MeterValues after reconnection, including suspended sessions with zero current.
+- Request connector status after the first OCPP call, even without BootNotification.
+- Include the last accepted current limit as a TxProfile in RemoteStartTransaction;
+  do not fall back to starting without a profile when rejected.
+- Add regression and OCPP/MQTT smoke coverage for profiled starts and recovery.
+- Reapply the saved current on recovered sessions before publishing confirmed
+  limit/session states; never acknowledge an active limit using only a default.
+- Serialize complete OCPP calls, bound send/response waits, ignore late/duplicate
+  responses, and replay recent duplicate incoming calls without repeating effects.
+- Ignore retired-connection responses and closed/other-transaction telemetry.
+- Publish session start/stop from actual events, not RemoteStart/Stop acceptance;
+  bound pending-command suppression to allow explicit retries.
+- Restore retained states and availability after MQTT reconnection or HA birth;
+  ignore retained control commands.
+- Validate finite limits and persisted state, flush atomic state writes, and
+  avoid counting aggregate and phase power twice.
+- Block automatic restoration of corrupted persisted limits and discard pre-boot
+  acknowledgments even when a wallbox reboots without changing its socket.
+- Document recovery-aware HA triggers, hardware limitations, and supervised tests.
+
 ## 1.2.1
 
 - Publish MQTT availability as online when an OCPP connection is accepted,
