@@ -41,7 +41,7 @@ docker build \
   --pull \
   --build-arg BUILD_FROM=ghcr.io/home-assistant/aarch64-base-python:3.13-alpine3.21-2025.11.1 \
   --build-arg BUILD_ARCH=aarch64 \
-  --build-arg BUILD_VERSION=1.3.0 \
+  --build-arg BUILD_VERSION=1.4.0 \
   --tag evbox-elvi-ocpp:test \
   evbox_elvi_ocpp
 ```
@@ -153,7 +153,7 @@ The primary state topics are:
 | --- | --- |
 | `evbox_elvi/availability` | `online` while an accepted OCPP connection is active; `offline` on disconnect |
 | `evbox_elvi/charge_control/state` | Charging-session state |
-| `evbox_elvi/charger_availability/state` | `ON` when the connector is free; `OFF` when occupied or unavailable |
+| `evbox_elvi/charger_availability/state` | `ON` when free; `OFF` when occupied; `None` for unknown/faulted/unavailable/reserved |
 | `evbox_elvi/maximum_current/state` | Last current limit accepted by the Elvi |
 | `evbox_elvi/current_import/state` | Measured charging current in A |
 | `evbox_elvi/power_active_import/state` | Measured charging power in kW |
@@ -206,8 +206,9 @@ After reconnection, switches, measurements, and the maximum-current number reset
 to `None` (Home Assistant `unknown`), not guessed off/zero values. The bridge
 requests connector status and recovers an active transaction from MeterValues.
 It reapplies the saved limit using an active `TxProfile` or idle `TxDefaultProfile`
-and publishes the number only after acceptance on this connection. An active
-session is exposed as ON only after that synchronization and power evidence.
+and publishes the number only after acceptance for the appropriate scope on
+this connection. Session ON is an observed fact, independent of profile acceptance
+or meter arrival: unknown current/power must never be treated as zero by automation.
 Without an active transaction ID, no default-only command can confirm an active
 limit. MQTT reconnection republishes the latest states, then online/offline.
 Corrupted saved state blocks automatic restoration: select a valid current
@@ -218,7 +219,7 @@ StartTransaction assigns an ID. Acceptance is not a physical readback: validate
 the measured current on the Elvi before enabling automation. No automatic
 start/stop or solar policy is added.
 
-Version 1.3.0 doesn't yet publish separate sensors for cumulative energy or
+Version 1.4.0 doesn't publish separate sensors for cumulative energy or
 session energy. Do not treat `maximum_current/state` as an
 instantaneous-current measurement.
 
@@ -246,12 +247,28 @@ may reject values unsupported by its firmware. A value of 5 A is allowed to
 preserve the suspension behavior used by the solar automation.
 
 When the connector is confirmed idle, the command sets its `TxDefaultProfile`.
-An active/unknown session without a transaction ID rejects the command instead
-of falsely acknowledging a default as an active limit. During a recovered
+An observed active session without a transaction ID rejects the command instead
+of falsely acknowledging a default as an active limit. With completely unknown
+session state, an explicit command can set a default, but the number stays unknown
+until an idle state is observed or an active transaction profile is accepted.
+During a recovered
 transaction, it first sends a higher-stack
 `TxProfile` bound to that transaction ID so the limit applies to the active
 session. Only after that profile is accepted does it update the default for the
 next session.
+
+Repeated explicit current commands are forwarded, even if equal to the accepted
+number. A rejection preserves the previous confirmation; a timeout makes it
+unknown because the command might have been applied. Recovery makes one attempt
+per connection/session scope, not a retry on every incoming packet. Retry current
+explicitly after inspecting a failure. Never send retained control commands.
+
+Remote start reasserts the saved default and includes a TxProfile, without a
+local connector-status whitelist (`Finishing` is not vetoed). It is not sent if
+the protective default operation fails or belongs to a retired scope. A new
+StartTransaction triggers a transaction-bound profile after its response.
+Neither remote start/stop acceptance nor a repeated command fabricates session
+ON/OFF. There is no automatic start, stop, reset, or restart strategy.
 
 ### Adjust the current limit
 

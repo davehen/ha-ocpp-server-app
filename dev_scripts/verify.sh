@@ -28,6 +28,9 @@ mqtt_name="ha-ocpp-verify-mqtt-${run_identifier}"
 bridge_name="ha-ocpp-verify-bridge-${run_identifier}"
 
 cleanup() {
+    if [[ "$?" != "0" ]]; then
+        docker logs "${bridge_name}" >&2 2>/dev/null || true
+    fi
     docker rm --force "${bridge_name}" "${mqtt_name}" >/dev/null 2>&1 || true
     docker network rm "${network_name}" >/dev/null 2>&1 || true
 }
@@ -40,7 +43,7 @@ docker build \
     --pull \
     --build-arg "BUILD_FROM=${build_from}" \
     --build-arg "BUILD_ARCH=${build_arch}" \
-    --build-arg "BUILD_VERSION=1.3.0" \
+    --build-arg "BUILD_VERSION=1.4.0" \
     --tag "${image_name}" \
     evbox_elvi_ocpp
 
@@ -48,6 +51,7 @@ docker run --rm \
     --entrypoint python3 \
     --env PYTHONDONTWRITEBYTECODE=1 \
     --volume "${repository_directory}/tests:/tests:ro" \
+    --volume "${script_directory}:/dev_scripts:ro" \
     "${image_name}" \
     -m unittest discover -s /tests -v
 
@@ -76,7 +80,7 @@ docker run --detach \
     --env OCPP_ID_TAG=HomeAssistant \
     --env HEARTBEAT_INTERVAL=300 \
     --env METER_VALUE_INTERVAL=60 \
-    --env CONFIGURE_METER_VALUES=false \
+    --env CONFIGURE_METER_VALUES=true \
     --env MAXIMUM_CURRENT=16 \
     --env NUMBER_OF_PHASES=3 \
     --env COMMAND_TIMEOUT=20 \

@@ -1,5 +1,5 @@
 name: EVBox Elvi OCPP bridge
-version: "1.3.0"
+version: "1.4.0"
 slug: evbox_elvi_ocpp
 description: Frozen OCPP 1.6J to MQTT bridge for an EVBox Elvi
 url: https://github.com/davehen/ha-ocpp-server-app

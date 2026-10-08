@@ -4,6 +4,7 @@ from concurrent.futures import Future
 from types import SimpleNamespace
 
 from app.mqtt import InvalidMqttCommand, MqttBridge, MqttCommandRejected
+from app.ocpp import OcppCallError
 
 
 class MqttDiscoveryTests(unittest.TestCase):
@@ -64,6 +65,7 @@ class MqttCommandLoggingTests(unittest.TestCase):
         for error in (
             InvalidMqttCommand("invalid payload"),
             MqttCommandRejected("charger rejected command"),
+            OcppCallError("NotSupported", "legacy firmware", {}),
         ):
             with self.subTest(error=type(error).__name__):
                 future: Future[None] = Future()
@@ -74,6 +76,14 @@ class MqttCommandLoggingTests(unittest.TestCase):
 
                 self.assertEqual(logs.records[0].levelname, "WARNING")
                 self.assertIsNone(logs.records[0].exc_info)
+
+    def test_timeout_and_disconnect_are_warnings_not_programming_tracebacks(self):
+        for error in (TimeoutError(), ConnectionError("closed")):
+            future = Future()
+            future.set_exception(error)
+            with self.assertLogs("app.mqtt", level="WARNING") as logs:
+                MqttBridge._log_command_failure(future)
+            self.assertIsNone(logs.records[0].exc_info)
 
     def test_unexpected_command_error_keeps_error_traceback(self) -> None:
         future: Future[None] = Future()

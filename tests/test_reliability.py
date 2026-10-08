@@ -1,4 +1,4 @@
-"""Regression coverage for reconnects, pending operations and persisted state."""
+"""Race/recovery regressions, persisted-state integrity and MQTT restoration."""
 
 from __future__ import annotations
 
@@ -11,16 +11,15 @@ from types import SimpleNamespace
 from unittest.mock import Mock, patch
 
 import test_bridge as fixtures
-from app.bridge import extract_power_kw
+from app.bridge import BridgeController
 from app.mqtt import MqttBridge, MqttCommandRejected
 from app.state import StateStore
 
 
 class PendingConnection(fixtures.FakeConnection):
-    def __init__(self) -> None:
+    def __init__(self):
         super().__init__()
-        self.sent = asyncio.Event()
-        self.release = asyncio.Event()
+        self.sent, self.release = asyncio.Event(), asyncio.Event()
 
     async def call(self, action, payload):
         self.calls.append((action, payload))
@@ -31,346 +30,213 @@ class PendingConnection(fixtures.FakeConnection):
 
 class RecoveryTests(unittest.IsolatedAsyncioTestCase):
     setUp = fixtures.BridgeControllerTests.setUp
-    prepare_idle = fixtures.BridgeControllerTests.prepare_idle
+    asyncTearDown = fixtures.BridgeControllerTests.asyncTearDown
+    command = fixtures.BridgeControllerTests.command
+    status = fixtures.BridgeControllerTests.status
+    drain = fixtures.BridgeControllerTests.drain
+    active = fixtures.BridgeControllerTests.active
 
-    async def drain_sync(self, action="MeterValues") -> None:
-        await self.bridge.after_ocpp_call(action)
-        if self.bridge._sync_task is not None:
-            await self.bridge._sync_task
-        if self.bridge._initialization_task is not None:
-            await self.bridge._initialization_task
+    async def test_restart_recovers_suspended_session_from_zero_meter_without_boot(self):
+        self.store.state.maximum_current = 5
+        await self.active(current="0", power="0")
+        self.assertTrue(self.mqtt.values["charge_control"])
+        self.assertEqual(self.mqtt.values["current"], 0)
+        self.assertIsNone(self.mqtt.values["maximum_current"])
+        await self.drain()
+        self.assertEqual(self.mqtt.values["maximum_current"], 5)
+        self.assertFalse(
+            any(
+                a in {"RemoteStartTransaction", "RemoteStopTransaction", "Reset"}
+                for a, _ in self.connection.calls
+            )
+        )
 
-    async def recover(self, transaction_id=123, power="5400") -> None:
+    async def test_restart_recovers_active_session_and_limit_from_same_store(self):
+        await self.active()
+        await self.command("maximum_current", 6)
+        self.bridge.detach(self.connection)
+        self.bridge = BridgeController(self.config, self.mqtt, self.store)
+        self.connection = fixtures.FakeConnection()
+        await self.active()
+        await self.drain()
+        self.assertEqual(self.mqtt.values["maximum_current"], 6)
+        self.assertEqual(self.bridge.state.transaction_id, 123)
+
+    async def test_idle_clock_energy_does_not_invent_session_or_zero_power(self):
+        await self.bridge.attach(self.connection)
         await self.bridge.handle_ocpp_call(
             "MeterValues",
             {
                 "connectorId": 1,
-                "transactionId": transaction_id,
                 "meterValue": [
                     {
+                        "timestamp": "2026-10-08T19:30:00Z",
                         "sampledValue": [
-                            {"measurand": "Power.Active.Import", "value": power, "unit": "W"},
-                            {"measurand": "Current.Import", "value": "8", "unit": "A"},
-                        ]
+                            {
+                                "value": "24930370",
+                                "context": "Sample.Clock",
+                                "measurand": "Energy.Active.Import.Register",
+                                "unit": "Wh",
+                            }
+                        ],
                     }
                 ],
             },
         )
-
-    async def test_active_status_without_id_cannot_acknowledge_default_limit(self) -> None:
-        await self.bridge.attach(self.connection)
-        await self.bridge.handle_ocpp_call(
-            "StatusNotification", {"connectorId": 1, "status": "Charging"}
-        )
-        with self.assertRaises(MqttCommandRejected):
-            await self.bridge.handle_mqtt_command("evbox_elvi/maximum_current/set", "6")
-        self.assertEqual(self.connection.calls, [])
         self.assertIsNone(self.mqtt.values["charge_control"])
-        self.assertIsNone(self.mqtt.values["maximum_current"])
-
-    async def test_idle_recovery_reapplies_saved_default(self) -> None:
-        self.bridge._store.state.maximum_current = 8
-        await self.bridge.attach(self.connection)
-        await self.bridge.handle_ocpp_call(
-            "StatusNotification", {"connectorId": 1, "status": "Preparing"}
-        )
-        self.assertIsNone(self.mqtt.values["charge_control"])
-        await self.drain_sync("StatusNotification")
+        self.assertIsNone(self.mqtt.values["power"])
+        await self.status("Finishing", timestamp=fixtures.NOW)
+        await self.drain()
         self.assertEqual(self.mqtt.values["maximum_current"], 8)
-        self.assertFalse(self.mqtt.values["charge_control"])
-        profiles = [
-            p["csChargingProfiles"] for a, p in self.connection.calls if a == "SetChargingProfile"
-        ]
-        self.assertEqual(profiles[0]["chargingProfilePurpose"], "TxDefaultProfile")
+        await self.command("charge_control", "ON")
+        self.assertEqual(self.connection.calls[-1][0], "RemoteStartTransaction")
 
-    async def test_active_recovery_applies_saved_limit_before_exposing_on(self) -> None:
-        self.bridge._store.state.maximum_current = 8
-        await self.bridge.attach(self.connection)
-        seen = []
-        original = self.mqtt.publish_charge_control
-
-        def snapshot(value):
-            if value:
-                seen.append((self.mqtt.values["power"], self.mqtt.values["maximum_current"]))
-            original(value)
-
-        self.mqtt.publish_charge_control = snapshot
-        await self.recover()
-        self.assertIsNone(self.mqtt.values["charge_control"])
-        await self.drain_sync()
-        self.assertTrue(self.mqtt.values["charge_control"])
-        self.assertTrue(all(power == 5.4 and current == 8 for power, current in seen))
-        profile = self.connection.calls[0][1]["csChargingProfiles"]
-        self.assertEqual(profile["transactionId"], 123)
-        self.assertEqual(profile["chargingSchedule"]["chargingSchedulePeriod"][0]["limit"], 8)
-
-    async def test_suspended_recovery_keeps_session_and_five_amp_limit(self) -> None:
-        self.bridge._store.state.maximum_current = 5
-        await self.bridge.attach(self.connection)
-        await self.recover(power="0")
-        await self.drain_sync()
-        self.assertTrue(self.mqtt.values["charge_control"])
-        self.assertEqual(self.mqtt.values["maximum_current"], 5)
-        self.assertFalse(self.mqtt.values["availability"])
-
-    async def test_rejected_recovery_remains_unknown_and_can_retry_on_next_message(self) -> None:
-        await self.bridge.attach(self.connection)
-        await self.recover()
+    async def test_rejected_recovery_is_one_bounded_attempt_not_a_meter_retry_storm(self):
+        await self.active()
         self.connection.responses["SetChargingProfile"] = {"status": "Rejected"}
-        await self.drain_sync()
-        self.assertIsNone(self.mqtt.values["charge_control"])
+        await self.drain()
+        for _ in range(5):
+            await self.drain("Heartbeat")
+        profiles = [a for a, _ in self.connection.calls if a == "SetChargingProfile"]
+        self.assertEqual(len(profiles), 1)
+        self.assertTrue(self.mqtt.values["charge_control"])
         self.assertIsNone(self.mqtt.values["maximum_current"])
         self.connection.responses.clear()
-        await self.drain_sync("Heartbeat")
-        self.assertTrue(self.mqtt.values["charge_control"])
+        await self.command("maximum_current", 8)
+        self.assertEqual(self.mqtt.values["maximum_current"], 8)
 
-    async def test_remote_start_acceptance_is_not_a_started_session(self) -> None:
-        await self.prepare_idle(8)
-        await self.bridge.handle_mqtt_command("evbox_elvi/charge_control/set", "ON")
-        self.assertFalse(self.mqtt.values["charge_control"])
+    async def test_queued_command_cannot_cross_connection_or_session(self):
+        await self.active()
+        await self.bridge._command_lock.acquire()
+        pending = asyncio.create_task(self.command("maximum_current", 5))
+        await asyncio.sleep(0)
+        await self.bridge.handle_ocpp_call("StopTransaction", {"transactionId": 123})
+        self.bridge._command_lock.release()
         with self.assertRaises(MqttCommandRejected):
-            await self.bridge.handle_mqtt_command("evbox_elvi/charge_control/set", "ON")
-        await self.bridge.handle_ocpp_call(
-            "StatusNotification", {"connectorId": 1, "status": "Preparing"}
-        )
-        self.assertIsNone(self.mqtt.values["charge_control"])
-        await self.bridge.handle_ocpp_call("StartTransaction", {"connectorId": 1})
-        await self.drain_sync("StartTransaction")
-        self.assertIsNone(self.mqtt.values["charge_control"])
-        await self.recover(self.bridge._transaction_id)
-        self.assertTrue(self.mqtt.values["charge_control"])
+            await pending
+        self.assertEqual(self.connection.calls, [])
 
-    async def test_stop_acceptance_and_final_meter_do_not_flip_session(self) -> None:
-        await self.bridge.attach(self.connection)
-        await self.recover()
-        await self.drain_sync()
-        await self.bridge.handle_mqtt_command("evbox_elvi/charge_control/set", "OFF")
-        self.assertTrue(self.mqtt.values["charge_control"])
-        await self.recover()
-        self.assertTrue(self.mqtt.values["charge_control"])
-        await self.bridge.handle_ocpp_call("StopTransaction", {"transactionId": 123})
-        await self.drain_sync("StopTransaction")
-        self.assertFalse(self.mqtt.values["charge_control"])
-        await self.recover()
-        self.assertFalse(self.mqtt.values["charge_control"])
-        self.assertIsNone(self.bridge._transaction_id)
-
-    async def test_closed_transaction_is_not_recovered_on_next_connection(self) -> None:
-        await self.bridge.attach(self.connection)
-        await self.recover()
-        await self.bridge.handle_ocpp_call("StopTransaction", {"transactionId": 123})
+    async def test_old_profile_ack_cannot_commit_to_replacement_connection(self):
+        self.connection = PendingConnection()
+        await self.active()
+        old = self.connection
+        pending = asyncio.create_task(self.command("maximum_current", 5))
+        await old.sent.wait()
         await self.bridge.attach(fixtures.FakeConnection())
-        await self.recover()
-        self.assertIsNone(self.bridge._transaction_id)
-        self.assertIsNone(self.mqtt.values["charge_control"])
+        old.release.set()
+        with self.assertRaises(MqttCommandRejected):
+            await pending
+        self.assertEqual(self.store.state.maximum_current, 8)
+        self.assertIsNone(self.mqtt.values["maximum_current"])
 
-    async def test_old_stop_and_other_transaction_meter_do_not_override_active(self) -> None:
-        await self.bridge.attach(self.connection)
-        await self.recover(222)
-        await self.drain_sync()
-        await self.bridge.handle_ocpp_call("StopTransaction", {"transactionId": 111})
-        await self.recover(111, "0")
-        self.assertEqual(self.bridge._transaction_id, 222)
-        self.assertTrue(self.mqtt.values["charge_control"])
-        self.assertEqual(self.mqtt.values["power"], 5.4)
+    async def test_boot_on_same_socket_retires_old_profile_ack(self):
+        self.connection = PendingConnection()
+        await self.active()
+        pending = asyncio.create_task(self.command("maximum_current", 5))
+        await self.connection.sent.wait()
+        await self.bridge.handle_ocpp_call("BootNotification", {})
+        self.connection.release.set()
+        with self.assertRaises(MqttCommandRejected):
+            await pending
+        self.assertEqual(self.store.state.maximum_current, 8)
 
-    async def test_retired_connection_cannot_change_new_session(self) -> None:
-        await self.bridge.attach(self.connection)
+    async def test_retired_socket_cannot_send_stop_for_new_session(self):
+        await self.active()
         old = self.connection
         await self.bridge.attach(fixtures.FakeConnection())
-        await self.recover(222)
+        await self.bridge.handle_ocpp_call("MeterValues", fixtures.meter(222))
         with self.assertRaises(ConnectionError):
             await self.bridge.handle_ocpp_call(
                 "StopTransaction", {"transactionId": 222}, connection=old
             )
-        self.assertEqual(self.bridge._transaction_id, 222)
+        self.assertEqual(self.bridge.state.transaction_id, 222)
 
-    async def test_command_queued_on_retired_connection_is_discarded(self) -> None:
-        await self.prepare_idle(8)
-        await self.bridge._command_lock.acquire()
-        pending = asyncio.create_task(
-            self.bridge.handle_mqtt_command("evbox_elvi/maximum_current/set", "5")
-        )
-        await asyncio.sleep(0)
-        new = fixtures.FakeConnection()
-        await self.bridge.attach(new)
-        self.bridge._command_lock.release()
-        with self.assertRaises(MqttCommandRejected):
-            await pending
-        self.assertEqual(new.calls, [])
-
-    async def test_old_profile_acknowledgment_does_not_commit_to_new_connection(self) -> None:
-        old = PendingConnection()
-        await self.bridge.attach(old)
-        await self.recover(111)
-        pending = asyncio.create_task(
-            self.bridge.handle_mqtt_command("evbox_elvi/maximum_current/set", "8")
-        )
-        await old.sent.wait()
-        new = fixtures.FakeConnection()
-        await self.bridge.attach(new)
-        await self.recover(222)
-        old.release.set()
-        with self.assertRaises(MqttCommandRejected):
-            await pending
-        self.assertEqual(new.calls, [])
-        self.assertIsNone(self.mqtt.values["maximum_current"])
-
-    async def test_active_acknowledgment_is_published_before_default_timeout(self) -> None:
-        await self.bridge.attach(self.connection)
-        await self.recover()
-        original = self.connection.call
-
-        async def fail_default(action, payload):
-            if (
-                payload.get("csChargingProfiles", {}).get("chargingProfilePurpose")
-                == "TxDefaultProfile"
-            ):
-                self.assertEqual(self.mqtt.values["maximum_current"], 8)
-                self.assertEqual(self.bridge._store.state.maximum_current, 8)
-                raise TimeoutError("mock default timeout")
-            return await original(action, payload)
-
-        self.connection.call = fail_default
-        await self.bridge.handle_mqtt_command("evbox_elvi/maximum_current/set", "8")
-        self.assertEqual(self.mqtt.values["maximum_current"], 8)
-
-    async def test_persistence_error_does_not_hide_accepted_live_limit(self) -> None:
-        await self.bridge.attach(self.connection)
-        await self.recover()
-        self.bridge._store.save = Mock(side_effect=OSError("mock disk full"))
-        with self.assertLogs("app.bridge", level="ERROR"):
-            await self.bridge.handle_mqtt_command("evbox_elvi/maximum_current/set", "8")
-        self.assertEqual(self.mqtt.values["maximum_current"], 8)
-
-    async def test_same_confirmed_current_is_a_noop(self) -> None:
-        await self.prepare_idle(8)
-        await self.bridge.handle_mqtt_command("evbox_elvi/maximum_current/set", "8")
-        self.assertEqual(self.connection.calls, [])
-
-    async def test_idle_profile_ack_cannot_confirm_an_unrecovered_active_session(self) -> None:
-        connection = PendingConnection()
-        await self.bridge.attach(connection)
-        await self.bridge.handle_ocpp_call(
-            "StatusNotification", {"connectorId": 1, "status": "Preparing"}
-        )
-        pending = asyncio.create_task(
-            self.bridge.handle_mqtt_command("evbox_elvi/maximum_current/set", "8")
-        )
-        await connection.sent.wait()
-        await self.bridge.handle_ocpp_call(
-            "StatusNotification", {"connectorId": 1, "status": "Charging"}
-        )
-        connection.release.set()
-        with self.assertRaises(MqttCommandRejected):
-            await pending
-        self.assertIsNone(self.mqtt.values["maximum_current"])
-
-    async def test_reboot_on_same_socket_invalidates_an_inflight_idle_profile(self) -> None:
-        connection = PendingConnection()
-        await self.bridge.attach(connection)
-        await self.bridge.handle_ocpp_call(
-            "StatusNotification", {"connectorId": 1, "status": "Preparing"}
-        )
-        pending = asyncio.create_task(
-            self.bridge.handle_mqtt_command("evbox_elvi/maximum_current/set", "8")
-        )
-        await connection.sent.wait()
-        await self.bridge.handle_ocpp_call("BootNotification", {})
-        await self.bridge.handle_ocpp_call(
-            "StatusNotification", {"connectorId": 1, "status": "Preparing"}
-        )
-        connection.release.set()
-        with self.assertRaises(MqttCommandRejected):
-            await pending
-        self.assertIsNone(self.mqtt.values["maximum_current"])
-
-    async def test_invalid_persisted_state_cannot_automatically_raise_current(self) -> None:
-        self.bridge._store.valid = False
-        await self.bridge.attach(self.connection)
-        await self.recover()
-        await self.drain_sync()
-        self.assertFalse(any(a == "SetChargingProfile" for a, _ in self.connection.calls))
-        self.assertIsNone(self.mqtt.values["maximum_current"])
-        await self.bridge.handle_mqtt_command("evbox_elvi/maximum_current/set", "8")
-        self.assertTrue(self.bridge._store.valid)
-        self.assertEqual(self.mqtt.values["maximum_current"], 8)
-
-    async def test_accepted_start_can_be_retried_after_missing_start_transaction(self) -> None:
-        await self.prepare_idle(8)
-        await self.bridge.handle_mqtt_command("evbox_elvi/charge_control/set", "ON")
-        await self.bridge.handle_ocpp_call(
-            "StatusNotification", {"connectorId": 1, "status": "Preparing"}
-        )
-        with patch("app.bridge.time.monotonic", return_value=self.bridge._pending_until + 1):
-            await self.bridge.handle_mqtt_command("evbox_elvi/charge_control/set", "ON")
-        self.assertEqual([a for a, _ in self.connection.calls].count("RemoteStartTransaction"), 2)
-
-    async def test_stop_arriving_before_remote_stop_response_does_not_leave_pending_flag(
-        self,
-    ) -> None:
-        await self.bridge.attach(self.connection)
-        await self.recover()
-        original = self.connection.call
-
-        async def finish_first(action, payload):
-            if action == "RemoteStopTransaction":
-                await self.bridge.handle_ocpp_call("StopTransaction", {"transactionId": 123})
-            return await original(action, payload)
-
-        self.connection.call = finish_first
-        await self.bridge.handle_mqtt_command("evbox_elvi/charge_control/set", "OFF")
-        self.assertFalse(self.bridge._stop_pending)
-
-    async def test_stop_on_reconnect_prevents_historical_meter_recovery(self) -> None:
-        self.bridge._store.state.last_transaction_id = 123
-        await self.bridge.attach(self.connection)
+    async def test_closed_transaction_cannot_be_resurrected_after_reconnect(self):
+        await self.active()
         await self.bridge.handle_ocpp_call("StopTransaction", {"transactionId": 123})
-        await self.recover()
-        self.assertIsNone(self.bridge._transaction_id)
-        self.assertEqual(self.bridge._store.state.last_closed_transaction_id, 123)
+        await self.bridge.attach(fixtures.FakeConnection())
+        await self.bridge.handle_ocpp_call("MeterValues", fixtures.meter(123))
+        self.assertIsNone(self.bridge.state.transaction_id)
+        self.assertIsNone(self.mqtt.values["charge_control"])
 
-    async def test_fault_is_not_mistaken_for_a_plugged_idle_car(self) -> None:
+    async def test_old_stop_and_other_transaction_meter_do_not_override_live_session(self):
+        await self.active(222)
+        await self.bridge.handle_ocpp_call("StopTransaction", {"transactionId": 111})
+        await self.bridge.handle_ocpp_call("MeterValues", fixtures.meter(111, "0", "0"))
+        self.assertEqual(self.bridge.state.transaction_id, 222)
+        self.assertTrue(self.mqtt.values["charge_control"])
+        self.assertEqual(self.mqtt.values["power"], 5.52)
+
+    async def test_foreign_stop_does_not_poison_current_transaction_watermark(self):
+        await self.active(222)
+        await self.bridge.handle_ocpp_call("StopTransaction", {"transactionId": 999})
+        await self.bridge.handle_ocpp_call("MeterValues", fixtures.meter(222, "6", "4140"))
+        self.assertEqual(self.mqtt.values["current"], 6)
+        self.assertLess(self.store.state.last_closed_transaction_id, 222)
+
+    async def test_preparing_on_reconnect_does_not_block_transaction_evidence(self):
         await self.bridge.attach(self.connection)
+        await self.status("Preparing")
+        await self.bridge.handle_ocpp_call("MeterValues", fixtures.meter(123, "0", "0"))
+        self.assertEqual(self.bridge.state.transaction_id, 123)
+        self.assertTrue(self.mqtt.values["charge_control"])
+
+    async def test_failed_active_default_is_restored_to_target_after_stop(self):
+        await self.active()
+        self.bridge.state.default_limit = 12
+        self.connection.response_sequences["SetChargingProfile"] = [
+            {"status": "Accepted"},
+            {"status": "Rejected"},
+        ]
+        await self.command("maximum_current", 6)
+        self.assertEqual(self.bridge.state.default_limit, 12)
+        await self.bridge.handle_ocpp_call("StopTransaction", {"transactionId": 123})
+        await self.drain("StopTransaction")
+        self.assertEqual(self.mqtt.values["maximum_current"], 6)
+
+    async def test_buffered_meter_does_not_undo_later_suspension_status(self):
+        await self.active()
+        await self.status("SuspendedEVSE", timestamp="2026-10-08T20:00:00Z")
         await self.bridge.handle_ocpp_call(
-            "StatusNotification", {"connectorId": 1, "status": "Faulted"}
+            "MeterValues", fixtures.meter(123, "8", "5520", "2026-10-08T19:59:59Z")
         )
-        await self.drain_sync("StatusNotification")
-        self.assertIsNone(self.mqtt.values["availability"])
+        self.assertEqual(self.mqtt.values["power"], 0)
+        self.assertEqual(self.mqtt.values["current"], 0)
+
+    async def test_older_status_does_not_close_newer_session(self):
+        await self.active()
+        await self.status("Charging", timestamp="2026-10-08T20:00:00Z")
+        await self.status("Available", timestamp="2026-10-08T19:59:59Z")
+        self.assertEqual(self.bridge.state.transaction_id, 123)
+
+    async def test_invalid_persisted_target_blocks_restore_and_start_not_live_facts(self):
+        self.store.valid = False
+        await self.active()
+        await self.drain()
+        self.assertTrue(self.mqtt.values["charge_control"])
+        self.assertFalse(any(a == "SetChargingProfile" for a, _ in self.connection.calls))
         with self.assertRaises(MqttCommandRejected):
-            await self.bridge.handle_mqtt_command("evbox_elvi/charge_control/set", "ON")
+            await self.command("charge_control", "ON")
+        await self.command("maximum_current", 8)
+        self.assertTrue(self.store.valid)
 
-    async def test_older_status_is_ignored(self) -> None:
-        await self.bridge.attach(self.connection)
-        for status, timestamp in (
-            ("Charging", "2026-10-08T16:20:00Z"),
-            ("Available", "2026-10-08T16:00:00Z"),
-        ):
-            await self.bridge.handle_ocpp_call(
-                "StatusNotification", {"connectorId": 1, "status": status, "timestamp": timestamp}
-            )
-        self.assertEqual(self.bridge._status, "Charging")
+    async def test_persistence_error_keeps_live_ack_visible(self):
+        await self.active()
+        self.store.save = Mock(side_effect=OSError("disk full"))
+        with self.assertLogs("app.bridge", "ERROR"):
+            await self.command("maximum_current", 6)
+        self.assertEqual(self.mqtt.values["maximum_current"], 6)
 
-    async def test_older_meter_does_not_overwrite_newer_measurement(self) -> None:
+    async def test_allocator_does_not_acknowledge_disk_failure(self):
         await self.bridge.attach(self.connection)
-        for value, timestamp in (("5000", "2026-10-08T16:20:00Z"), ("0", "2026-10-08T16:00:00Z")):
-            await self.bridge.handle_ocpp_call(
-                "MeterValues",
-                {
-                    "connectorId": 1,
-                    "meterValue": [
-                        {
-                            "timestamp": timestamp,
-                            "sampledValue": [{"measurand": "Power.Active.Import", "value": value}],
-                        }
-                    ],
-                },
-            )
-        self.assertEqual(self.mqtt.values["power"], 5)
+        self.store.save = Mock(side_effect=OSError("disk full"))
+        with self.assertRaises(OSError):
+            await self.bridge.handle_ocpp_call("StartTransaction", {"connectorId": 1})
+        self.assertIsNone(self.bridge.state.transaction_id)
 
 
 class PersistenceTests(unittest.TestCase):
-    def test_invalid_saved_current_is_rejected(self) -> None:
+    def test_invalid_saved_current_is_rejected(self):
         for current in (float("nan"), float("inf"), -1, 33, True):
             store = StateStore(Path("/unused"), 16)
             with patch.object(
@@ -381,24 +247,21 @@ class PersistenceTests(unittest.TestCase):
             self.assertEqual(store.state.maximum_current, 16)
             self.assertFalse(store.valid)
 
-    def test_invalid_saved_transaction_ids_are_rejected_without_crashing(self) -> None:
+    def test_invalid_saved_transaction_ids_are_rejected(self):
         for transaction_id in (True, 1.5, float("inf"), "123"):
             store = StateStore(Path("/unused"), 16)
             with patch.object(
                 Path,
                 "read_text",
                 return_value=json.dumps(
-                    {
-                        "maximum_current": 8,
-                        "last_transaction_id": transaction_id,
-                    }
+                    {"maximum_current": 8, "last_transaction_id": transaction_id}
                 ),
             ):
                 with self.assertLogs("app.state", level="ERROR"):
                     store.load()
             self.assertFalse(store.valid)
 
-    def test_atomic_round_trip_includes_closed_transaction_marker(self) -> None:
+    def test_atomic_round_trip_includes_closed_transaction_marker(self):
         with tempfile.TemporaryDirectory() as directory:
             store = StateStore(Path(directory), 16)
             store.state.maximum_current = 5
@@ -409,31 +272,8 @@ class PersistenceTests(unittest.TestCase):
             self.assertEqual(restored.load(), store.state)
 
 
-class PowerReliabilityTests(unittest.TestCase):
-    def test_total_and_phases_are_not_double_counted(self) -> None:
-        samples = [{"measurand": "Power.Active.Import", "value": "6000"}]
-        samples.extend(
-            {"measurand": "Power.Active.Import", "value": "2000", "phase": p}
-            for p in ("L1", "L2", "L3")
-        )
-        self.assertEqual(extract_power_kw({"meterValue": [{"sampledValue": samples}]}, 3), 6)
-
-    def test_invalid_power_is_not_reported_as_zero(self) -> None:
-        for value in ("nan", "inf", "-1"):
-            self.assertIsNone(
-                extract_power_kw(
-                    {
-                        "meterValue": [
-                            {"sampledValue": [{"measurand": "Power.Active.Import", "value": value}]}
-                        ]
-                    },
-                    3,
-                )
-            )
-
-
 class MqttRecoveryTests(unittest.IsolatedAsyncioTestCase):
-    async def test_reconnect_republishes_latest_snapshot_and_availability_last(self) -> None:
+    async def test_reconnect_republishes_latest_snapshot_and_availability_last(self):
         bridge = MqttBridge.__new__(MqttBridge)
         bridge._config = SimpleNamespace(mqtt_topic_prefix="evbox_elvi")
         sent = []
@@ -464,7 +304,7 @@ class MqttRecoveryTests(unittest.IsolatedAsyncioTestCase):
         )
         self.assertTrue(bridge._connected.is_set())
 
-    async def test_retained_control_command_is_not_executed(self) -> None:
+    async def test_retained_control_command_is_not_executed(self):
         bridge = MqttBridge.__new__(MqttBridge)
         bridge._command_handler = Mock()
         bridge._loop = asyncio.get_running_loop()

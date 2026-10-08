@@ -1,5 +1,25 @@
 # Changelog
 
+## 1.4.0
+
+- Replace the handwritten OCPP transport with pinned python-ocpp 2.0.0 (1.6
+  routing, schemas, serialization and response correlation), retaining bounded
+  waits, disconnect cancellation, duplicate replay and late-response filtering.
+- Replace scattered session/readiness flags with one connection-scoped model.
+  Session, connector, measurements, active-profile and default-profile acceptance
+  are distinct facts; a persisted recovery target is not a live acknowledgment.
+- Forward explicit starts from Finishing and other statuses to the firmware;
+  reassert the protected default and embed the saved limit in remote start.
+  Reapply a transaction-bound limit immediately after assigning a transaction ID.
+- Recover active/suspended sessions without BootNotification. Perform bounded
+  limit restoration once per scope; optional NotSupported does not gate commands.
+- Invalidate uncertain limits on timeout; retain confirmed limits on rejection.
+  Forward repeated explicit commands as retries, never automatically start/stop.
+- Update regression/mock coverage and document mandatory automation guards for
+  missing data. Keep all five MQTT IDs and do not edit the HA repository.
+- This version requires container and supervised Elvi validation before deployment;
+  software tests do not certify electrical safety or diagnose historical disconnects.
+
 ## 1.3.0
 
 - Centralize connection-state reset and connector switch reconciliation. Clear

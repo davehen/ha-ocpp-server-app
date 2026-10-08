@@ -104,15 +104,16 @@ blocks, not only the visible `entity_id`. The new MQTT entities can reuse the
 five names above, but they cannot inherit the internal IDs belonging to the
 removed OCPP integration.
 
-Static inspection of `davehomeassistant` found four blocks that must be
-replaced:
+The original migration affected four blocks (the current October 8 YAML
+already contains these state/action replacements):
 
 - the `Adapt charging power` trigger;
 - two `Auto-start charging` conditions;
 - the `Auto-start charging` turn-on action.
 
 `Safely apply current on charger` and `lovelace/vehicles_card.yaml` already use
-the visible entity IDs and don't require changes.
+the visible entity IDs. No HA repository file is modified by this project.
+The missing-data guards below are still needed before enabling automation.
 
 ### Adapt charging power trigger
 
@@ -169,6 +170,62 @@ Replace the device-based action with:
 Do not apply these changes until the new MQTT entities exist with the exact
 required IDs.
 
+## Automation data safety
+
+### Mandatory missing-data guards in Adapt charging power
+
+In 1.4.0, charge control ON means an **observed session**, not "all measurements
+and limits are initialized". The current YAML converts missing charger/home power
+to zero using `float(0)`, and missing confirmed current to 6 A. Those are not
+observations suitable for solar calculations. Preserve existing solar math,
+thresholds, delay, termination and cleanup policy; change only data handling:
+
+1. Inside `repeat.sequence`, wrap **Calculate new amperage** and the subsequent
+   **If target differs** action in this conditional. Keep the existing timeout
+   delay outside it, so missing data skips calculations but the watchdog keeps
+   running and can recover:
+
+   ```yaml
+   - alias: Calculate and apply only with valid live power inputs
+     if:
+       - condition: template
+         value_template: >-
+           {{ is_state('switch.charger_charge_control', 'on')
+              and is_number(states('sensor.charger_power_active_import'))
+              and is_number(states('sensor.power_meter_active_power')) }}
+     then:
+       # Put the existing Calculate new amperage variables action here.
+       # Put the existing If target differs / set-current event action here.
+   ```
+
+2. In the variables action, replace these definitions:
+
+   ```yaml
+   current_amp: "{{ states('number.charger_maximum_current') | float(none) }}"
+   need_update: >-
+     {{ current_amp is none or (target_amp - current_amp) | abs > TOLERANCE_AMP }}
+   ```
+
+   An unknown limit now requests an explicit retry of the calculated target
+   instead of inventing 6 A or waiting forever for a failed recovery ACK.
+   Power is calculated only from valid inputs; zero from an actual suspension
+   remains valid. Before transaction-ID recovery, the bridge can still reject
+   the command; the watchdog retries through the existing setting automation.
+
+The guard uses Home Assistant's documented
+[`is_number`](https://www.home-assistant.io/template-functions/is_number/)
+finite-number check rather than substituting a numeric value for missing data.
+
+These are manual HA changes, not hidden charging logic in the add-on. Skipping
+an automation calculation does **not** stop charging: the last firmware limit
+can continue. Lost-data behavior remains an HA policy decision. Numeric retained
+readings are not a guarantee of freshness; inspect telemetry timestamps/logs if
+communication stalls. The bridge does not certify installation protection.
+
+The existing `FINAL_AMP: 12` is unchanged. If that cleanup was accepted, 12 A
+is the saved next-start target. Setting 8 A before start means 8 A is protected;
+the bridge does not silently choose 8 A when HA last requested 12 A.
+
 ## UI-managed resources to inspect
 
 The entity-registry export also contains:
@@ -210,11 +267,13 @@ owns the required ID. Do not continue until that conflict has been resolved.
 
 ## Functional validation
 
-When updating an existing installation to 1.3.0, update and restart the add-on,
+Before deploying 1.4.0, complete container/mock verification; keep automatic
+updates off. When updating an existing installation, update and restart the add-on,
 then wait for the Elvi to reconnect. Verify that `evbox_elvi/availability` is
 `online`. Switches and the limit may initially be `unknown`: wait for connector
 recovery and the logged accepted current profile. No entity recreation or MQTT
-broker changes are required. Apply the recovery-aware automation trigger above.
+broker changes are required. Apply the recovery-aware trigger and mandatory
+missing-data guards above before enabling charging automation.
 
 Run this test under direct supervision.
 
@@ -265,9 +324,10 @@ setpoint with the add-on log, the number state, and the Elvi's physical current.
 
 - When the wallbox disconnects, MQTT entities become unavailable.
 - After connection, switches and the number are unknown until connector/session
-  evidence and current synchronization are available. Transaction-bound MeterValues
-  recover an active or suspended session; ON additionally requires accepted current
-  synchronization and power evidence. Connector status is requested after the
+  evidence and current synchronization respectively are available. Transaction-bound
+  MeterValues recover an active or suspended session; ON does not require accepted
+  current or power arrival, and does not mean automation inputs are ready.
+  Connector status is requested after the
   first OCPP call, without requiring BootNotification.
 - A single connection reset invalidates both switches, the transaction ID, and
   measured current/power before publishing online. Missing measurements use the
@@ -279,8 +339,9 @@ setpoint with the add-on log, the number state, and the Elvi's physical current.
 - The saved setpoint is not a readback. On recovery the bridge reapplies it as an
   active TxProfile or idle TxDefaultProfile before publishing the confirmed number.
   An active session without a transaction ID cannot acknowledge a default-only
-  update as its active limit. A failed recovery remains unknown and can retry when
-  the next OCPP message arrives. There is no automatic start/stop or solar policy.
+  update as its active limit. A failed recovery leaves the number unknown and
+  does not retry on every normal message; explicitly retry the current command.
+  There is no automatic start/stop or solar policy.
 - Remote start includes the last accepted current as a TxProfile. Rejection does
   not trigger a second start without a limit. Confirm the measured current on
   real hardware; an accepted OCPP response is not a measurement.
@@ -291,15 +352,19 @@ setpoint with the add-on log, the number state, and the Elvi's physical current.
   normal update cadence is therefore `meter_value_interval`.
 - During charging, a new current limit is published only after the Elvi accepts
   a `TxProfile` bound to the active transaction ID.
-- A rejected or timed-out active profile preserves the previous value, allowing
-  the automation watchdog to retry.
+- A rejected active profile preserves the previous confirmation. Timeout makes
+  the affected limit unknown (uncertain outcome), retaining the saved target and
+  observed session. Repeated explicit commands are forwarded.
 - The app then updates `TxDefaultProfile` as a best-effort default for the next
   transaction; failure of this follow-up is logged without undoing the active
   limit.
 - A stop is rejected when no transaction ID is known.
-- RemoteStart/Stop acceptance is not session completion. Pending suppression
-  expires after `command_timeout` so an explicit retry is possible; no retry
-  automatically starts or stops the vehicle.
+- RemoteStart/Stop acceptance is not session completion. No local status whitelist
+  vetoes explicit start, including Finishing. Start reasserts the protected default
+  and includes its profile; failure never falls back to an unprofiled start.
+  Explicit repeated commands reach firmware; no automatic start/stop is added.
+- Unsupported optional GetConfiguration/TriggerMessage operations are logged and
+  skipped. They never gate session state or prevent subsequent commands.
 - Calls are serialized and send/response waits are bounded. Duplicate/late
   responses and retired connections cannot overwrite the current session.
 - Closed/other-transaction telemetry and older timestamped observations are ignored.

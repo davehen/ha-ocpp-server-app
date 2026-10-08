@@ -37,7 +37,7 @@ cd /Users/davide.gallina/Development/personal/ha-ocpp-server-app
 Verification succeeds only after printing:
 
 ```text
-Container smoke passed: profiled start, 8/6/5/8 A, recovery, confirmed stop
+Container smoke passed: Finishing start, NotSupported, 8/6/5/8 A, recovery, confirmed stop
 All container checks passed
 ```
 
@@ -51,7 +51,7 @@ The script performs these steps in order:
 4. runs every `unittest` test inside the newly built image;
 5. creates a temporary Docker network;
 6. starts an anonymous Mosquitto broker confined to that network;
-7. starts the bridge with `CONFIGURE_METER_VALUES=false`;
+7. starts the bridge with `CONFIGURE_METER_VALUES=true`;
 8. runs a simulated OCPP 1.6J charge point;
 9. removes the temporary containers and network, even after a failure.
 
@@ -67,6 +67,8 @@ the following end-to-end behavior:
 - `BootNotification` and an `Accepted` response;
 - actual connector status in response to initial `TriggerMessage`, followed by
   accepted idle-current synchronization;
+- a plugged-idle `Finishing` status, followed by a forwarded remote start;
+- `GetConfiguration` returning `NotSupported` without gating control;
 - an 8 A idle MQTT command and accepted TxDefaultProfile;
 - remote start carrying the accepted 8 A limit without a guessed transaction ID;
 - StartTransaction assignment and automatic transaction-bound current reapplication;
@@ -74,11 +76,13 @@ the following end-to-end behavior:
 - dynamic 6 A, 5 A suspension, and 8 A resume profiles on the same transaction,
   with active profile followed by the next-transaction default;
 - reconnection without BootNotification while suspended, reset to unknown, and
-  reapplication of the saved 5 A limit before publishing a confirmed ON session;
+  observed ON independently of current acknowledgment, followed by accepted
+  reapplication of the saved 5 A limit;
 - resumed measured charging after 8 A;
 - RemoteStop acceptance not optimistically turning OFF, followed by actual
   StopTransaction, idle-current synchronization, and OFF/zero state;
-- historical MeterValues not resurrecting a stopped session.
+- historical MeterValues not resurrecting a stopped session;
+- another explicit start from Finishing after the stop, without unplugging.
 
 The unit tests additionally cover availability after reconnection without
 BootNotification, remote start and stop, transaction IDs,
@@ -92,14 +96,39 @@ Regression tests also cover a single reset of all observations, preservation of
 the saved current limit, an active session without an ID refusing default-only
 confirmation, retired connections and queued commands, stale StopTransaction and
 MeterValues, duplicate responses and cached incoming CALLs, bounded send/response
-timeouts, pending start/stop races, MQTT snapshot restoration, retained command
+timeouts, start/stop event races, MQTT snapshot restoration, retained command
 rejection, persistence validation and atomic round trips, and aggregate/phase power
 without double counting. Missing measurements are unknown rather than guessed zero.
 These checks do not prove the physical Elvi applies an accepted profile, certify
 electrical safety, or establish the cause of the intermittent disconnection.
 
+`test_wire_bridge.py` also runs the library/controller against the same mock
+over real loopback WebSockets, capturing MQTT publication in memory. The container
+smoke then covers a separate real MQTT broker. Runtime versions are fully pinned
+in `evbox_elvi_ocpp/requirements.txt`; do not disable schemas to make tests pass.
+
 The mock doesn't communicate with the real Elvi, modify Home Assistant, or
 expose ports to the LAN.
+
+## Validation record — October 8, 2026
+
+- Davide ran the full Colima verification successfully: image build, 76 tests
+  on Python 3.13, and the separate real-MQTT/OCPP mock all passed.
+- Final review then corrected the scope of optional status/configuration
+  responses: they belong to the connection/boot epoch, not to a transaction
+  that their own notification may change. Six additional regression tests
+  cover this ordering, writable configuration, foreign stop IDs, reconnect
+  evidence, idle default recovery, and expected communication-error logging.
+- The resulting suite has 82 tests. The 79 checks not requiring loopback binding
+  or temporary-directory cleanup passed locally on Python 3.14. Davide then
+  reran the full `verify.sh` on the final code and reported success ("tutto ok"):
+  the final Colima run covers all 82 tests, the image build, and the complete
+  container smoke. This final result was user-reported; unlike the first run,
+  its complete output was not pasted into the conversation.
+- Supervised checks on the physical Elvi are still required, especially the
+  first start at the requested limit and recovery during an active or suspended
+  session. No electrical-safety certification or cause of the historical
+  disconnection can be inferred from mock results.
 
 ## Resources and cleanup
 
@@ -120,7 +149,9 @@ create persistent volumes.
 Unit tests without containers:
 
 ```shell
-PYTHONPATH=evbox_elvi_ocpp python3 -m unittest discover -s tests -v
+python3 -m venv .venv
+.venv/bin/python -m pip install -r evbox_elvi_ocpp/requirements.txt
+PYTHONPATH=evbox_elvi_ocpp .venv/bin/python -m unittest discover -s tests -v
 ```
 
 Python lint:
@@ -172,7 +203,7 @@ On an Intel host, use the equivalent `amd64-base-python` image.
 
 ### The mock fails
 
-The script prints bridge logs when the server doesn't become ready. To inspect
+The script prints bridge logs on a failure. To inspect
 resources that might remain after a forced interruption:
 
 ```shell
@@ -182,3 +213,12 @@ docker network ls --filter name=ha-ocpp-verify
 
 Do not remove resources with different names; they do not belong to this
 verification run.
+
+### Sandboxed agent permissions
+
+A sandbox can deny the Colima socket, loopback socket binding, TLS certificate
+reads or temporary-directory cleanup, even after user authorization. Do not
+disable TLS or skip assertions to manufacture a pass. Run the same verification
+from the user's normal Terminal and retain its complete output. A local test
+failure only in temporary cleanup is still a failed full local run, not proof
+that the full suite passed. Python 3.13 container verification is the release gate.

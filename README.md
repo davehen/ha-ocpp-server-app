@@ -13,13 +13,17 @@ Assistant remains responsible for all automation decisions.
 - [Automated build, mock, and tests](docs/VERIFY.md)
 - [Home Assistant installation and migration](docs/HOME_ASSISTANT.md)
 - [Home Assistant app-store documentation](evbox_elvi_ocpp/DOCS.md)
+- [State/command contract and regression rationale](docs/ARCHITECTURE.md)
 
 ## Development checks
 
-The protocol tests use only the Python standard library:
+The tests use unittest and the pinned runtime protocol dependencies. Install
+them in a local environment first (Python 3.13+):
 
 ```shell
-PYTHONPATH=evbox_elvi_ocpp python3 -m unittest discover -s tests -v
+python3 -m venv .venv
+.venv/bin/python -m pip install -r evbox_elvi_ocpp/requirements.txt
+PYTHONPATH=evbox_elvi_ocpp .venv/bin/python -m unittest discover -s tests -v
 ruff check .
 ```
 

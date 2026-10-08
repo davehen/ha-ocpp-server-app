@@ -7,6 +7,7 @@ import json
 import sys
 import threading
 from contextlib import suppress
+from datetime import UTC, datetime
 
 import paho.mqtt.client as mqtt
 from websockets.legacy.client import connect
@@ -20,7 +21,7 @@ class MockWallbox:
         self.changed = changed
         self.transaction_id = transaction_id
         self.current = 0
-        self.status = "Preparing" if transaction_id is None else "SuspendedEVSE"
+        self.status = "Finishing" if transaction_id is None else "SuspendedEVSE"
         self.commands, self.pending = [], {}
         self.sequence = 0
         self.reader = asyncio.create_task(self.read())
@@ -55,6 +56,9 @@ class MockWallbox:
             elif frame[0] == 2:
                 _, message_id, action, payload = frame
                 self.commands.append((action, payload))
+                if action == "GetConfiguration":
+                    await self.send([4, message_id, "NotSupported", "Legacy firmware", {}])
+                    continue
                 if action == "SetChargingProfile":
                     profile = payload["csChargingProfiles"]
                     if profile["chargingProfilePurpose"] == "TxProfile":
@@ -67,7 +71,8 @@ class MockWallbox:
                     if payload["requestedMessage"] == "StatusNotification":
                         await self.notify_status()
                     elif payload["requestedMessage"] == "MeterValues":
-                        await self.send([2, f"meter-{message_id}", "MeterValues", self.meter()])
+                        self.sequence += 1
+                        await self.send([2, f"meter-{self.sequence}", "MeterValues", self.meter()])
 
     async def notify_status(self):
         # Do not wait for a CALLRESULT in the sole receive task.
@@ -90,6 +95,7 @@ class MockWallbox:
             "connectorId": 1,
             "meterValue": [
                 {
+                    "timestamp": datetime.now(UTC).isoformat(),
                     "sampledValue": [
                         {"value": str(self.current), "measurand": "Current.Import", "unit": "A"},
                         {
@@ -97,7 +103,7 @@ class MockWallbox:
                             "measurand": "Power.Active.Import",
                             "unit": "W",
                         },
-                    ]
+                    ],
                 }
             ],
         }
@@ -135,8 +141,13 @@ async def run(bridge_host, mqtt_host):
         subscribed.set()
 
     def on_message(client, userdata, message):
-        states[message.topic.removeprefix("evbox_elvi/")] = message.payload.decode()
-        loop.call_soon_threadsafe(changed.set)
+        loop.call_soon_threadsafe(
+            record_state, message.topic.removeprefix("evbox_elvi/"), message.payload.decode()
+        )
+
+    def record_state(topic, payload):
+        states[topic] = payload
+        changed.set()
 
     client = mqtt.Client(
         callback_api_version=mqtt.CallbackAPIVersion.VERSION2, client_id="evbox-elvi-verifier"
@@ -274,7 +285,7 @@ async def run(bridge_host, mqtt_host):
                     },
                 )
                 wallbox.transaction_id = None
-                wallbox.current, wallbox.status = 0, "Preparing"
+                wallbox.current, wallbox.status = 0, "Finishing"
                 await wallbox.notify_status()
                 await state("charge_control/state", "OFF")
                 await state("maximum_current/state", "8")
@@ -283,12 +294,20 @@ async def run(bridge_host, mqtt_host):
                 historical["transactionId"] = transaction_id
                 await wallbox.call("MeterValues", historical)
                 assert states["charge_control/state"] == "OFF"
+                # This was the regression that blocked real HA auto-start.
+                await command("charge_control", "ON")
+                await wait_until(
+                    lambda: any(a == "RemoteStartTransaction" for a, _ in wallbox.commands),
+                    "remote start from Finishing after stop",
+                )
             finally:
                 await wallbox.close()
     finally:
         client.disconnect()
         client.loop_stop()
-    print("Container smoke passed: profiled start, 8/6/5/8 A, recovery, confirmed stop")
+    print(
+        "Container smoke passed: Finishing start, NotSupported, 8/6/5/8 A, recovery, confirmed stop"
+    )
 
 
 if __name__ == "__main__":

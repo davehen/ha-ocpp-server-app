@@ -82,7 +82,8 @@ visible `entity_id`. A new MQTT entity cannot inherit the internal ID of an OCPP
 custom-integration entity. The visible IDs can remain identical, but the four
 device-based blocks below must be recreated as state/action blocks.
 
-Static inspection of `davehomeassistant` found these affected blocks:
+The original migration affected these blocks (the current October 8 YAML
+already contains their state/action replacements):
 
 - `Adapt charging power`: its start trigger uses the old charge-control device
   entity.
@@ -90,7 +91,13 @@ Static inspection of `davehomeassistant` found these affected blocks:
   turn-on action use the old OCPP device entity.
 
 `Safely apply current on charger` and `lovelace/vehicles_card.yaml` already use
-the visible entity IDs and require no change.
+the visible entity IDs. Before enabling 1.4.0 automation, apply the mandatory
+missing-data guards in [the canonical HA guide](../docs/HOME_ASSISTANT.md#mandatory-missing-data-guards-in-adapt-charging-power):
+skip solar calculations while either power input is unknown/unavailable;
+use `float(none)` for the accepted current and treat an unknown limit as needing
+an explicit current retry. Keep the existing watchdog delay outside the guard.
+Session ON is an observation, not a readiness signal for other entities.
+The HA repository is not modified by this add-on.
 
 The exported registry also contains `script.charger_charge_control_guarded`,
 but its definition is not present in the repository. Inspect that UI-managed
@@ -200,13 +207,14 @@ charging and preserve a Home Assistant backup.
   are rejected and retained entity states are not presented as live.
 - Reconnection resets both switches, the number, and measurements to unknown.
   Connector status and transaction-bound MeterValues recover observations; the
-  saved limit is reapplied before publishing the confirmed number/session state.
-  An active session requires its transaction ID, an accepted TxProfile, and power
-  evidence. Suspended sessions remain active even at zero measured current.
+  saved limit is reapplied before publishing the confirmed number. Session ON
+  does not require accepted current or meter arrival. Suspended sessions remain
+  active even at zero measured current; guard missing power in HA automations.
 - Remote start includes the saved current profile and reapplies it once the
   transaction ID is assigned. RemoteStart/Stop acceptance is not completion: the
-  switches follow actual session evidence. Pending suppression expires after
-  `command_timeout` to permit explicit retries, without automatic start/stop.
+  switches follow actual session evidence. Explicit starts from Finishing and
+  other statuses reach firmware after protected default reapplication. No
+  unprofiled fallback or automatic start/stop is used.
 - MQTT reconnection and HA birth republish Discovery and latest states before
   availability. Retained commands are ignored.
 - Complete OCPP calls are serialized, send/response waits are bounded, and
@@ -215,13 +223,18 @@ charging and preserve a Home Assistant backup.
 - Measured current updates only when the Elvi sends `Current.Import`, normally
   at the configured `meter_value_interval`.
 - While charging, a current value is published only after the Elvi accepts the
-  transaction-bound `TxProfile`. A rejection or timeout leaves the previous
-  value unchanged, allowing the existing watchdog automation to try again.
+  transaction-bound `TxProfile`. A rejection retains the previous confirmation;
+  timeout makes that limit unknown because the outcome is uncertain. Repeated
+  explicit current values are forwarded. Recovery makes at most one attempt per
+  scope, not retries on every incoming packet.
 - After an active `TxProfile` is accepted, failure to update the best-effort
   `TxDefaultProfile` is logged but does not misreport the active command as
   failed.
 - A stop command is not fabricated when no OCPP transaction ID is known. The
   app logs the failure and leaves the switch state unchanged.
+- Optional NotSupported, including GetConfiguration on legacy firmware, is
+  logged and skipped without gating control. The protocol uses pinned
+  python-ocpp 2.0.0 with its 1.6 schemas; all runtime dependencies are pinned.
 - Invalid or unsupported charge-point calls receive an OCPP error response;
   malformed JSON is ignored without terminating the server.
 - The last current value accepted by the wallbox, transaction counter, and closed-session marker are

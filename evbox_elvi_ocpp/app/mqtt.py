@@ -9,6 +9,7 @@ from collections.abc import Awaitable, Callable
 from typing import Any
 
 from .config import Config
+from .ocpp import OcppCallError
 
 LOGGER = logging.getLogger(__name__)
 CommandHandler = Callable[[str, str], Awaitable[None]]
@@ -113,7 +114,7 @@ class MqttBridge:
             "device": device,
             "origin": {
                 "name": "EVBox Elvi OCPP bridge",
-                "sw_version": "1.3.0",
+                "sw_version": "1.4.0",
                 "support_url": "https://github.com/davehen/ha-ocpp-server-app",
             },
             "qos": 1,
@@ -341,7 +342,11 @@ class MqttBridge:
     def _log_command_failure(future: Any) -> None:
         try:
             future.result()
-        except (InvalidMqttCommand, MqttCommandRejected) as exc:
+        except (InvalidMqttCommand, MqttCommandRejected, OcppCallError) as exc:
             LOGGER.warning("MQTT command rejected: %s", exc)
+        except TimeoutError:
+            LOGGER.warning("MQTT command timed out; outcome unknown, not acknowledged")
+        except ConnectionError as exc:
+            LOGGER.warning("MQTT command interrupted by connection loss: %s", exc)
         except Exception:
             LOGGER.exception("MQTT command failed")
